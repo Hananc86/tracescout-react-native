@@ -1,0 +1,73 @@
+// A React Native autolinked library. The host application's root project
+// already puts the Android Gradle Plugin and the Kotlin plugin on the build
+// classpath, so this module declares no buildscript of its own: the SDK
+// compiles with the application's exact toolchain rather than pinning one.
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+// Read a version the host application publishes, and fall back to a supported
+// floor when it publishes none.
+def hostExt = { String prop, Object fallback ->
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}
+
+android {
+    namespace 'com.tracescout.rn.react'
+    compileSdk hostExt('compileSdkVersion', 35)
+
+    defaultConfig {
+        // The capture transport's floor is API 26, and it propagates to the
+        // host application through the manifest merger. Integrating this SDK
+        // raises an application's minSdk to 26; that is a support-matrix fact,
+        // not a build warning to silence with tools:overrideLibrary.
+        minSdk 26
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java']
+            manifest.srcFile 'src/main/AndroidManifest.xml'
+        }
+    }
+
+    lint { abortOnError false }
+}
+
+// The SDK targets Java 17 bytecode -- React Native's own baseline -- and does
+// NOT request a Java toolchain. Requesting one makes the build fail outright on
+// a machine whose only installed JDK is a different version, which is a failure
+// the application cannot fix from its own configuration.
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+dependencies {
+    // Supplied by the host application's React Native installation, never
+    // bundled, so the SDK cannot carry a second copy of React.
+    compileOnly "com.facebook.react:react-android"
+
+    implementation 'androidx.lifecycle:lifecycle-process:2.9.0'
+    // The connectivity-constrained recovery drain. A device with no usable
+    // network defers the work rather than losing the records.
+    implementation 'androidx.work:work-runtime:2.9.1'
+    implementation 'androidx.annotation:annotation:1.9.1'
+    // The host application already ships OkHttp -- React Native pins 4.9.2 --
+    // and bundling a second copy would put two OkHttp classes on one
+    // classpath. The SDK composes onto the application's client; it does not
+    // carry one. Same reasoning for appcompat: ReactActivity already extends
+    // AppCompatActivity, so the SDK wraps the callback appcompat installs
+    // rather than carrying a second AppCompatDelegate.
+    compileOnly 'com.squareup.okhttp3:okhttp:4.9.2'
+    compileOnly 'androidx.appcompat:appcompat:1.7.0'
+    // Compose UI is read for semantics when the host application uses it, and
+    // is never required: compileOnly means an application without Compose
+    // links and runs unchanged.
+    compileOnly 'androidx.compose.ui:ui:1.8.0'
+}

@@ -1,0 +1,7 @@
+node_modules/
+lib/
+*.tgz
+android/build/
+android/.cxx/
+ios/build/
+.DS_Store

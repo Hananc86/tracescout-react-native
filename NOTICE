@@ -1,0 +1,23 @@
+TraceScout React Native SDK
+Copyright 2026 TraceScout
+
+This product is licensed under the MIT License. See the LICENSE file.
+
+All first-party source in this package is original TraceScout work. No
+third-party source is included or redistributed here, so no third-party
+license text is carried.
+
+The package declares dependencies that the host application resolves at build
+time. Their code is not bundled in this package. Their licenses, read from the
+projects' own published license files and POM metadata:
+
+  React Native (com.facebook.react:react-android, React-Core)
+      MIT License, Copyright (c) Meta Platforms, Inc. and affiliates
+  androidx.lifecycle, androidx.work, androidx.annotation,
+  androidx.appcompat, androidx.compose.ui
+      Apache License, Version 2.0
+  OkHttp (com.squareup.okhttp3:okhttp)
+      Apache License, Version 2.0
+
+"TraceScout" and the TraceScout logo are trademarks of TraceScout. The MIT
+license covers the software and grants no trademark rights.

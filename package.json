@@ -1,0 +1,56 @@
+{
+  "name": "@tracescout/react-native",
+  "version": "0.1.0-next.1",
+  "description": "TraceScout session replay and loss-accounted capture for React Native.",
+  "license": "MIT",
+  "author": "TraceScout",
+  "homepage": "https://tracescout.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hananc86/tracescout-react-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hananc86/tracescout-react-native/issues"
+  },
+  "keywords": [
+    "react-native",
+    "android",
+    "ios",
+    "session-replay",
+    "observability",
+    "monitoring",
+    "tracescout"
+  ],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "src",
+    "android/build.gradle",
+    "android/src",
+    "ios",
+    "TraceScoutRN.podspec",
+    "react-native.config.js",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.build.json --noEmit"
+  },
+  "peerDependencies": {
+    "react-native": ">=0.73.0"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  }
+}
