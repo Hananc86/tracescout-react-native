@@ -34,6 +34,20 @@ Installing this SDK raises an Android application's `minSdk` to 26, because the
 capture transport's floor is 26 and that propagates through the manifest
 merger. That is a support-matrix decision, not a build warning to suppress.
 
+### Permissions it adds
+
+The SDK's own manifest declares two permissions, and its WorkManager dependency
+contributes three more through the manifest merger. Measured on a merged
+release manifest, not estimated:
+
+| permission | contributed by |
+|---|---|
+| `INTERNET`, `ACCESS_NETWORK_STATE` | this SDK, to upload captured records |
+| `FOREGROUND_SERVICE`, `RECEIVE_BOOT_COMPLETED`, `WAKE_LOCK` | `androidx.work`, which the SDK uses to defer a drain when there is no usable network |
+
+It declares no location, storage, camera, contacts or advertising-identifier
+permission, and reads no hardware or advertising identifier.
+
 ## Configure
 
 The ingest credential is installed in **native** code, by your application.
