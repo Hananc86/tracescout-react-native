@@ -1,0 +1,76 @@
+name: Publish to npm
+
+# Manual only. Publishing is an explicit act, never a side effect of a push.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to publish"
+        required: true
+        default: v0.1.0-next.1
+      dist-tag:
+        description: "npm dist-tag"
+        required: true
+        default: next
+      dry-run:
+        description: "Pack and check without publishing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # the OIDC token npm exchanges; no npm token is stored
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # npm 11 is required for OIDC trusted publishing; npm 12 needs node >= 22.
+      - run: npm install -g npm@11
+
+      - run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Build the TypeScript surface
+        run: npm run build
+
+      - name: Prepublish check over the packed file list
+        run: python3 scripts/prepublish-check.py .
+
+      - name: Pack and record the artifact
+        run: |
+          set -euo pipefail
+          npm pack
+          T=$(ls *.tgz)
+          echo "tarball=$T" >> "$GITHUB_ENV"
+          sha256sum "$T" | tee -a "$GITHUB_STEP_SUMMARY"
+          tar tzf "$T" | wc -l | xargs -I{} echo "packed files: {}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish
+        if: ${{ !inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          # Provenance needs a public repository. It is attempted, and the
+          # documented E422 fallback keeps a release from failing on it alone.
+          if ! npm publish "$tarball" --access public --tag "${{ inputs.dist-tag }}" --provenance 2>err.log; then
+            cat err.log
+            grep -q 'E422' err.log || exit 1
+            echo "provenance unavailable; retrying without it" >> "$GITHUB_STEP_SUMMARY"
+            npm publish "$tarball" --access public --tag "${{ inputs.dist-tag }}" --no-provenance
+          fi
+
+      - name: Verify the registry agrees
+        if: ${{ !inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          sleep 10
+          npm view @tracescout/react-native versions --json
+          npm dist-tag ls @tracescout/react-native | tee -a "$GITHUB_STEP_SUMMARY"
