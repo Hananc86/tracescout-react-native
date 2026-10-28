@@ -19,14 +19,16 @@ Autolinking registers the native module on both platforms. No `Podfile` or
 
 ### Supported versions
 
-Verified against the toolchain below. Earlier versions in the declared range
-are expected to work and are not yet covered by a build in this repository.
+The declared range is what the package allows. The "built and run on" column
+is the single toolchain a clean external application was actually compiled and
+launched against; every other combination in the declared range is expected to
+work and has not been built here. Nothing in this table is a tested matrix.
 
 | | |
 |---|---|
-| React Native | `>= 0.73`, built and verified on 0.88 |
-| Android | minSdk **26**, compileSdk 35, Gradle 8.14.3, AGP 8.7.3, Kotlin 2.1.20, Java 17 |
-| iOS | 13.4 or later, Swift 5.9 |
+| React Native | declared `>= 0.73`; built and run on **0.88.1** |
+| Android | minSdk **26** (declared); built and run on compileSdk 37, Gradle 9.4.1, Kotlin 2.3.0, JDK 21 |
+| iOS | declared 13.4 or later, Swift 5.9; built and run on the iOS simulator |
 | New Architecture | works; the module is a classic bridge module, which the New Architecture supports through interop |
 | Expo | not verified. It needs a config plugin for the native configuration step below, which this package does not yet ship |
 
@@ -77,6 +79,47 @@ On Android the key is encrypted with an AES-256/GCM key held in the Android
 Keystore and never extractable from it. The plaintext key is never written to
 AsyncStorage, SharedPreferences, the JavaScript bundle, a log, a bridge
 response or crash metadata.
+
+**iOS** — `application(_:didFinishLaunchingWithOptions:)`:
+
+```swift
+import TraceScoutRN
+
+SecureConfig.configure(
+  projectId: "YOUR_PROJECT_ID",
+  ingestKey: yourIngestKey,
+  environment: "production",
+  endpoint: "https://api.tracescout.com"
+)
+```
+
+On iOS the credential is held in the keychain. Note the argument is
+`endpoint:`, where Android's is `baseUrl`.
+
+### Start the uploader
+
+Configuring stores the credential; it does not start the upload transport.
+Start it once, in the same native place, immediately after configuring:
+
+```kotlin
+RnTransport.start(this)              // Android, import com.tracescout.mobile.rn.RnTransport
+```
+
+```swift
+RnTransport.shared.start()           // iOS
+```
+
+Both are idempotent, so a second call cannot start a second uploader.
+
+Until this runs, `state()` reports `NOT_CONFIGURED` and nothing is ever
+uploaded. What else happens differs by platform, and both were measured in a
+clean application: on **Android** the SDK still accepts each call and reports
+`RECORDED`, so semantics are captured and never sent; on **iOS** the transport
+owns session identity, so calls report `NOT_CONFIGURED` or `NO_SESSION` and
+nothing is captured at all. After it runs, `state()` reports `READY` on both.
+
+That one call is the difference between an SDK that is installed and an SDK
+that is reporting, so check `state()` once during integration.
 
 ## Use
 
@@ -137,9 +180,11 @@ both clocks and the privacy posture are native and have no parameter to set.
 
 ## Status
 
-This is a prerelease, published under the `next` tag. The Android library and
-the TypeScript surface are built and verified; see the repository for what each
-release was tested against.
+This is a prerelease, published under the `next` tag. A clean external React
+Native application has been built and launched with this package on both
+platforms, and every function in the API table above was called from
+JavaScript on a running device. See the repository for what each release was
+tested against.
 
 ## License
 
