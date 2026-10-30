@@ -1,0 +1,156 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# tracescout-react-native — CodeRabbit review configuration.
+#
+# ENFORCED, NOT ADVISORY. Owner rule OWNER-CODERABBIT-MERGE-GATE-20261030
+# (tracescout board event 169), narrowed by
+# OWNER-CODERABBIT-SIGNIFICANT-ONLY-20261030 (event 171): a pull request may
+# merge only after CodeRabbit has genuinely reviewed its CURRENT head and every
+# SIGNIFICANT finding is fixed and verified. Cosmetic items do not block but are
+# recorded.
+#
+# ⭐ THIS IS THE ONE TraceScout REPOSITORY WHERE GITHUB ITSELF CAN ENFORCE IT,
+# and the reason is that it is PUBLIC. Measured 2026-10-30 (T-721): the private
+# repositories answer HTTP 403 "Upgrade to GitHub Pro" for both
+# `branches/<default>/protection` and `/rulesets`, while here both endpoints
+# work. Ruleset 26187510 "CodeRabbit merge gate" is active on `main` with no
+# bypass actor: a direct write to main is refused 409 "Changes must be made
+# through a pull request".
+# ⚠️ That ruleset originally ALSO required review-thread resolution, and
+# it was removed: OWNER-CODERABBIT-SIGNIFICANT-ONLY-20261030 forbids
+# "unresolved-thread-count==0 … as the gate". A cosmetic item never
+# blocks a merge; only a significant finding on the current head does.
+#
+# ⚠️ WHAT THE RULESET STILL CANNOT DO, stated rather than implied: it does not
+# yet REQUIRE the `CodeRabbit` status check, because the CodeRabbit GitHub App
+# has no access to this repository — measured, not assumed: pull request #1 has
+# zero CodeRabbit comments, zero reviews and no `coderabbitai` check run.
+# Requiring a check that can never appear would deadlock the repository with no
+# escape. The owner step and the exact command to add it are in the T-721
+# report. Until then the agent-side gate (/root/lib/ts-merge.sh) is what holds
+# a merge here, and it refuses for want of a review.
+#
+# The settings below are ADAPTED to this repository, not copied from the
+# private baselines: this is a PUBLISHED, MIT-licensed npm package whose
+# consumers are third parties, so the review is pointed at the public API
+# surface and at what ships in the tarball.
+
+language: en-US
+
+reviews:
+  # --- the merge gate ----------------------------------------------------------
+  # ⚠️ allow_author_approval DEFAULTS TO TRUE, which would let the author of a
+  # pull request type `@coderabbitai approve` on their own change. Every change
+  # here is opened by the same account that would merge it. Off.
+  auto_approvals:
+    enabled: true
+    allow_author_approval: false
+  fail_commit_status: true
+
+  # Pre-merge checks default to mode `warning`; on the sibling repositories one
+  # of them fails on every pull request over a cosmetic docstring threshold,
+  # which is cosmetic feedback presented as a failing check. Off.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+  # These produce "generate docstrings / generate unit tests" work items rather
+  # than findings.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  # Measured on this repository before being applied: 0 issues, 0 labels applied
+  # to any pull request, 0 reviewers ever requested, 1 collaborator. Each line
+  # below removes a walkthrough section that can only ever be empty here.
+  related_issues: false
+  assess_linked_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  in_progress_fortune: false
+  poem: false
+
+  path_filters:
+    - "!**/build/**"
+    - "!**/node_modules/**"
+    - "!android/gradle/wrapper/gradle-wrapper.jar"
+
+  path_instructions:
+    - path: "src/**"
+      instructions: >-
+        This is the PUBLIC JavaScript surface of a published npm package, so a
+        change here is a change to somebody else's integration. Report: an
+        exported name, signature, default or return shape that changes without
+        the README and the package version saying so; a method reachable from
+        JavaScript that can reach native code the native side does not bound; a
+        promise that can reject without the caller being able to tell a refusal
+        from a failure; and a value that an application passes in reaching a
+        log, a crash report or the wire without redaction. Do NOT report
+        formatting, naming, import order or a missing docstring.
+    - path: "android/**/*.kt"
+      instructions: >-
+        Native Android side of the bridge. Report: a @ReactMethod that trusts a
+        value supplied by JavaScript without bounding it; work done on the main
+        thread that can block the UI; an exception that escapes into
+        Application.onCreate or a lifecycle callback and can crash the host
+        application; a record enqueued with no reachable drain; and any end-user
+        value reaching a log or an uploaded payload before redaction.
+    - path: "ios/**/*.{swift,m,h}"
+      instructions: >-
+        Native iOS side of the bridge. Report the same classes as the Android
+        side, plus: a method exported to JavaScript in the ObjC interface file
+        that has no Swift implementation (or the reverse, a Swift method that is
+        not exported and is therefore unreachable); a swizzle or observer
+        installed on a class the host application also owns; and a String length
+        bound expressed in the wrong unit — Swift counts grapheme clusters,
+        JSON maxLength counts code points and a varchar bound counts bytes.
+    - path: "{package.json,TraceScoutRN.podspec,react-native.config.js,tsconfig.build.json}"
+      instructions: >-
+        These decide what a third party actually installs. Report: a `files`
+        entry that ships source, tests or credentials that should not leave the
+        repository, or omits something the package needs at runtime; a
+        dependency added to `dependencies` that belongs in `peerDependencies`;
+        a version or platform bound that disagrees with the podspec; and any
+        change to the published name, version or entry point that the README
+        does not describe.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Report only: a secret reachable from an untrusted input (this
+        repository is PUBLIC, so a workflow that runs on `pull_request_target`
+        or checks out a fork's head with a token is a real exposure), a
+        permissions block wider than the job needs, an unpinned third-party
+        action, and a path filter that cannot start the job it guards. Do not
+        comment on step naming or YAML style.
+
+  # All 59 tools are on by default. Only the three English-prose linters are
+  # disabled; every security and correctness tool (gitleaks, trufflehog,
+  # semgrep, opengrep, checkov, osvScanner, presidio, detekt, swiftlint,
+  # eslint, actionlint, …) stays ON — this package is public, so a leaked
+  # credential here is public immediately.
+  tools:
+    languagetool:
+      enabled: false
+    vale:
+      enabled: false
+    markdownlint:
+      enabled: false
