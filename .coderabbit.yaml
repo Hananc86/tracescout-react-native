@@ -15,7 +15,11 @@
 # `branches/<default>/protection` and `/rulesets`, while here both endpoints
 # work. Ruleset 26187510 "CodeRabbit merge gate" is active on `main` with no
 # bypass actor: a direct write to main is refused 409 "Changes must be made
-# through a pull request", and an unresolved review thread blocks the merge.
+# through a pull request".
+# ⚠️ That ruleset originally ALSO required review-thread resolution, and
+# it was removed: OWNER-CODERABBIT-SIGNIFICANT-ONLY-20261030 forbids
+# "unresolved-thread-count==0 … as the gate". A cosmetic item never
+# blocks a merge; only a significant finding on the current head does.
 #
 # ⚠️ WHAT THE RULESET STILL CANNOT DO, stated rather than implied: it does not
 # yet REQUIRE the `CodeRabbit` status check, because the CodeRabbit GitHub App
