@@ -77,6 +77,27 @@ object RnEnvelope {
  * filters could not match one.
  */
         val device: DeviceFacts? = null,
+        /**
+ * The IDENTIFIED USER (G2), as the host app named it through
+ * `identify`. Null until it does — and null is ANONYMOUS, which is a
+ * fact, not a gap.
+ *
+ * THE ONE IDENTITY FACT THE SDK CANNOT ESTABLISH ITSELF, which is
+ * why it is settable at all. `appIdentifier`, `appVersion`,
+ * `buildNumber` and `device` are all read natively precisely so a JS
+ * value cannot claim to be a different application, build or device.
+ * There is no `Context.getUserId`: only the host app's own auth
+ * system knows who is signed in, so this value MUST come from the host
+ * and the native-only rule above does not reach it. (The browser SDK
+ * treats `userId` as a first-class caller-supplied envelope field for
+ * exactly the same reason.)
+ *
+ * VALIDATED BY [IdentityPolicy], NEVER BY A CALL SITE. It refuses
+ * rather than truncating — a shortened opaque key is a DIFFERENT user —
+ * and accepts verbatim, because the browser producer writes this same
+ * column with no trim and one customer key must not be stored two ways.
+ */
+        val userId: String? = null,
     )
 
     /**
@@ -128,6 +149,45 @@ object RnEnvelope {
  * RN route identities are kind:"route" per the canonical enum.
  */
     data class ScreenRef(val screenId: String, val kind: String = "route")
+
+    /**
+ * One `frames[]` entry of a `mobile_crash` / `mobile_hang` event.
+ *
+ * TYPED, BECAUSE AN UNTYPED MAP WOULD SHIP AS A QUOTED STRING. `value`
+ * ends in `else -> str(v.toString)`, so a `LinkedHashMap` passed as a
+ * frame would reach the wire as `"{index=0, symbol=…}"` — the exact defect
+ * the INT64_AS_STRING and `is Float` comments in this file record twice. A
+ * typed arm is the only shape that cannot do that silently.
+ *
+ * NO `address`, AND NO `message` ANYWHERE ON THE EVENT. The schema
+ * declares both `frames[].address` and a top-level `message`; this producer
+ * emits neither. A raw address is only useful with the exact binary it came
+ * from and is a pointer into the process the privacy model says nothing
+ * about; the message exclusion is inherited from the Android native
+ * producer's own stated rule — "application code interpolates values into
+ * messages, and a crash report is not an exemption from the privacy model".
+ * `symbol` is the developer's own identifier, which is why it is the one
+ * string the contract bounds rather than forbids.
+ */
+    data class IncidentFrame(
+        val index: Int,
+        val module: String? = null,
+        val symbol: String? = null,
+        /**
+ * The symbolication artifact this stack resolves against, on frame 0
+ * ONLY — the DEPLOYED planner reads `frames[0].artifactKind` and
+ * `frames[0].artifactIdentifier` and nothing else, so putting it on
+ * every frame would pay bytes forever for a value the server reads once.
+ *
+ * A VALUE OUTSIDE THE SERVER'S VOCABULARY IS A PERMANENT 422 ON THE
+ * WHOLE CHUNK (`incident_artifact_kind_invalid`), taking the hierarchy,
+ * taps and frames batched with it. Absence is legal — symbolication is
+ * optional — so the caller supplies this only when it genuinely knows
+ * the artifact identity.
+ */
+        val artifactKind: String? = null,
+        val artifactIdentifier: String? = null,
+    )
 
     /**
  * MODEL B's **S** on the envelope — the native↔WebView correlation.
@@ -201,6 +261,27 @@ object RnEnvelope {
         fields["sessionId"] = id.sessionId
         fields["anonymousId"] = id.anonymousId
         fields["environment"] = id.environment
+        // EVERY EVENT, NOT THE OPENER — the one identity fact that breaks
+        // the opener-only rule below, and deliberately.
+        //
+        // The rule below exists "for values that cannot change within the
+        // session". `userId` is the single identity fact that CAN: `identify`
+        // is a mid-session call, so an anonymous session that signs in minutes
+        // after its opener must still be attributable. The deployed server says
+        // the same thing from its own side — it learns the identity "across the
+        // WHOLE chunk rather than from its first envelope", because "the
+        // envelope that carries a userId is routinely NOT the one that opened
+        // the chunk" — and resolves conflicts by HIGHEST SEQUENCE.
+        //
+        // Stamping every event is therefore also SELF-HEALING: the winner is
+        // the highest sequence the server ever sees, so one lost or quarantined
+        // chunk cannot strand a session as anonymous forever. Stamping once
+        // would be cheaper and would make the identity depend on a single
+        // chunk surviving.
+        //
+        // A null is OMITTED by `json`, never emitted as null, so an anonymous
+        // session pays no bytes at all for this.
+        fields["userId"] = id.userId
         // Only the opener needs to name the app — the server reads identity
         // from the `mobile_session_start` event alone. Emitting it on every
         // event would be redundant bytes on a per-event wire.
@@ -492,6 +573,130 @@ object RnEnvelope {
     }
 
     // ------------------------------------------------------------- emission
+    /**
+ * The `mobile_crash` event.
+ *
+ * THE FIELD NAMES ARE THE CONTRACT'S, NOT THE ANDROID NATIVE PRODUCER'S,
+ * AND THE DIFFERENCE IS MEASURED. Native's `emit/Envelope.kt` emits
+ * `exceptionType` and `stackFrames` and NO `crashClass`, while the deployed
+ * planner reads `crashClass` and `frames` — so all 13 production crash rows
+ * carry `incident_class = NULL` and `frame_count = 0`, every crash marker in
+ * the Viewer renders "Crash: unknown class", and `frames[0].artifactKind`
+ * can never be read so the stack has no artifact identity to symbolicate
+ * against. Emitting the canonical names is what makes this producer's rows
+ * usable; the native divergence is reported separately, not papered over
+ * here by copying it.
+ *
+ * `deliveredOnNextLaunch` IS ALWAYS TRUE FOR A FATAL CRASH, and it is a
+ * statement about this record's ONLY possible delivery path rather than a
+ * guess. The process is dying: the record is appended synchronously in the
+ * crash region and the upload happens on the next launch. The protocol
+ * declares the field precisely so a reader does not mistake that gap for
+ * clock skew.
+ *
+ * NO MESSAGE. See [IncidentFrame] and `IncidentPolicy`.
+ */
+    fun crash(
+        id: Identity,
+        eventId: String,
+        sequence: Long,
+        timestampMillis: Long,
+        monotonicNanos: Long,
+        posture: Posture,
+        /**
+ * REQUIRED and bounded. The DEPLOYED planner refuses an absent or
+ * over-long value with `incident_identity_missing` /
+ * `incident_identity_invalid`, a PERMANENT 422 on the whole chunk — so
+ * the caller must supply one and this builder must not invent a
+ * fallback that would hide the omission.
+ */
+        errorId: String,
+        /** A member of [IncidentPolicy.CRASH_CLASSES] — classified by the policy, never here. */
+        crashClass: String,
+        exceptionType: String?,
+        threadName: String?,
+        isMainThread: Boolean?,
+        frames: List<IncidentFrame>,
+        screenId: String?,
+        fatal: Boolean = true,
+    ): String {
+        val extra = LinkedHashMap<String, Any?>()
+        extra["errorId"] = errorId
+        extra["crashClass"] = crashClass
+        extra["fatal"] = fatal
+        // The schema's name for the exception class is `type`. Bounded to the
+        // same length the schema declares; `json` omits a null.
+        extra["type"] = IncidentPolicy.boundType(exceptionType)
+        extra["threadName"] = IncidentPolicy.boundThreadName(threadName)
+        extra["isMainThread"] = isMainThread
+        extra["deliveredOnNextLaunch"] = true
+        extra["frames"] = frames.ifEmpty { null }
+        IncidentPolicy.boundScreenId(screenId)?.let { extra["screen"] = ScreenRef(it) }
+        // THE FRAME CAP IS NOT DISCLOSED ON THE WIRE, AND THAT IS THE
+        // CONTRACT'S DOING. The envelope's `dropped` map is a PER-FAMILY LOSS
+        // counter whose own description says "intentional privacy suppression is
+        // NOT loss and must never appear here", and the server reads only five
+        // of its keys; a within-event frame truncation is neither. There is no
+        // declared field for it, and `unevaluatedProperties: false` means
+        // inventing one is exactly what native did with `exceptionType` /
+        // `stackFrames` — the divergence measured in this file's KDoc. The drop
+        // is disclosed LOCALLY by the producer through `RecoveryTrace`, which is
+        // this programme's established channel for a fact with no wire field.
+        return envelope(
+            id, eventId, "mobile_crash", sequence, timestampMillis, monotonicNanos, posture, extra,
+        )
+    }
+
+    /**
+ * The `mobile_hang` event.
+ *
+ * `blockedMs` IS A `Long`, NOT A `Double`, AND THAT IS DELIBERATE. The
+ * `value` dispatcher renders a non-finite `Double` as `0` — a real
+ * duration — so a NaN computed across a clock step would be stored as a
+ * zero-millisecond hang. A `Long` cannot be non-finite, and
+ * `IncidentPolicy.hangIsEmittable` refuses the value upstream anyway, so the
+ * two guards are independent rather than the same guard twice.
+ *
+ * `recovered` IS NOT INFERRED. A hang observed by a watchdog that is
+ * still running has, by construction, been survived — but whether the
+ * process is later killed is not knowable at emit time, so the caller states
+ * what it observed and this builder does not guess.
+ */
+    fun hang(
+        id: Identity,
+        eventId: String,
+        sequence: Long,
+        timestampMillis: Long,
+        monotonicNanos: Long,
+        posture: Posture,
+        errorId: String,
+        /** A member of [IncidentPolicy.HANG_KINDS] — from the policy, never here. */
+        hangKind: String,
+        blockedMs: Long,
+        thresholdMs: Long?,
+        recovered: Boolean,
+        frames: List<IncidentFrame>,
+        screenId: String?,
+        deliveredOnNextLaunch: Boolean = false,
+    ): String {
+        val extra = LinkedHashMap<String, Any?>()
+        extra["errorId"] = errorId
+        extra["hangKind"] = hangKind
+        extra["blockedMs"] = blockedMs
+        extra["threshold"] = thresholdMs
+        extra["recovered"] = recovered
+        extra["deliveredOnNextLaunch"] = deliveredOnNextLaunch
+        extra["frames"] = frames.ifEmpty { null }
+        // `mobile_hang` declares its OWN `screenId` string (not a screen
+        // object), and the deployed planner reads `e.screenId` before
+        // `e.screen.screenId` — so the declared shape is what goes on the wire.
+        extra["screenId"] = IncidentPolicy.boundScreenId(screenId)
+        // The frame cap is traced locally, never put on the wire — see `crash`.
+        return envelope(
+            id, eventId, "mobile_hang", sequence, timestampMillis, monotonicNanos, posture, extra,
+        )
+    }
+
     private fun json(m: Map<String, Any?>): String = buildString {
         append('{')
         var first = true
@@ -615,6 +820,13 @@ object RnEnvelope {
         is Double -> if (v.isFinite()) v.toString() else "0"
         is NodeBounds -> json(linkedMapOf(
             "x" to v.x, "y" to v.y, "width" to v.w, "height" to v.h,
+        ))
+        // Declared keys only, in schema order. `json` omits every null, so a
+        // frame with no resolved module or symbol ships exactly `{"index":n}`,
+        // which is what `frames[].required: ["index"]` asks for.
+        is IncidentFrame -> json(linkedMapOf(
+            "index" to v.index, "module" to v.module, "symbol" to v.symbol,
+            "artifactKind" to v.artifactKind, "artifactIdentifier" to v.artifactIdentifier,
         ))
         is List<*> -> v.joinToString(",", "[", "]") { value(key, it) }
         else -> str(v.toString())

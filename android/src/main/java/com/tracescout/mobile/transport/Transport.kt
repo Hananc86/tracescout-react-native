@@ -269,3 +269,127 @@ fun terminalDisposition(status: Int, code: String?): TerminalDisposition = when 
     status == 404 -> TerminalDisposition.RETAIN_SESSION_PRECONDITION
     else -> TerminalDisposition.QUARANTINE_PREFIX
 }
+
+// ---------------------------------------------------------------------------
+// HOST-FACING TRANSPORT STATE
+//
+// EXTRACTED, NOT INVENTED. This is the decision `RnTransport.classify` and
+// `RnTransport.retryIsOwedToWorker` have always made, moved to sit beside
+// [terminalDisposition] — the refusal classification it is the host-facing half
+// of. It exists here because a SECOND producer binding (Flutter) needs the same
+// answer, and two copies of "which refusals may auto-retry" is two policies
+// that can drift about when the SDK spins against a credential only the app can
+// fix.
+//
+// The DURABILITY decision stays with [terminalDisposition] and the pipeline;
+// this says only what a HOST may be told and who owes the retry. Both are read
+// from the typed CODE, never from an HTTP status or the server's `retriable`
+// flag — the deployed API's `reject(code, detail, retriable = false)` defaults
+// to permanent, so one omitted argument on the server must never become a
+// client policy input.
+
+/** Typed states a host may surface. Deliberately never queue contents. */
+enum class HostTransportState {
+    NOT_CONFIGURED,
+    READY,
+    /** A BUILD fact: this producer is not admitted. No retry can clear it. */
+    PRODUCER_UNSUPPORTED,
+    /** A CREDENTIAL fact: the queue is intact and only the app can fix it. */
+    AUTH_REJECTED,
+    /**
+ * The session this batch addresses does not exist YET. The queue is
+ * retained byte-for-byte and the constrained worker retries the SAME
+ * records under bounded backoff — unlike AUTH_REJECTED and
+ * PRODUCER_UNSUPPORTED, this condition can clear by itself.
+ */
+    SESSION_PRECONDITION,
+    PENDING_NETWORK,
+    /**
+ * F4-P0 Slice D: the pipeline refused before any request because an
+ * eviction bracket is unresolved or its marker is unreadable. The next
+ * OPEN retries recovery; no automatic worker retry is owed.
+ */
+    STORAGE_RECOVERY_BLOCKED,
+    /** An erasure was requested; it completes under the fence at the next open. */
+    ERASURE_PENDING,
+    /**
+ * The queue could not be READ at all, so records may still be there.
+ *
+ * NOT A SERVER CODE — no refusal string maps here, because this is a
+ * LOCAL drain condition the transport observes before any request. It is
+ * in this enum because it is a state a host may be surfaced and because
+ * [retryOwedToWorker] must have an answer for it; `hostTransportState`
+ * deliberately cannot produce it.
+ *
+ * Transient, NOT a Slice D condition: Slice D declines a schedule because
+ * only the next OPEN can conclude a bracket or an erasure, whereas a READ
+ * has no such restriction — the very next drain can succeed once the key
+ * or the file is available again. Reporting this as a finished drain is
+ * the F-6/F-42 loss class (the obligation released with records on disk).
+ */
+    QUEUE_UNREADABLE,
+    /**
+ * Another holder owns the drain lease, so this attempt never looked.
+ *
+ * NOT A SERVER CODE, for the same reason as [QUEUE_UNREADABLE]. Owed a
+ * retry in the same transient sense: the holder releases, and the very
+ * next drain can read and deliver. `false` here would be the caller
+ * discarding the obligation precisely when it could not discharge it.
+ */
+    DRAIN_LEASE_BUSY,
+}
+
+/**
+ * The typed state a transport result must produce for the host.
+ *
+ * `producer_unsupported` and `producer_parked` are the SAME fact here: a
+ * producer-capability refusal no retry can clear. They differ only in whether
+ * the bytes moved out of the active queue, which is an internal durability
+ * detail and not a state an app should branch on.
+ *
+ * A null code is READY: nothing refused.
+ *
+ * This function can NEVER answer [HostTransportState.QUEUE_UNREADABLE] or
+ * [HostTransportState.DRAIN_LEASE_BUSY], and that is deliberate: both are local
+ * drain conditions observed before any request, so no server code may be read
+ * as either. The `else` arm below sends an unknown code to PENDING_NETWORK,
+ * which keeps that property true for any code the server grows later.
+ */
+fun hostTransportState(code: String?): HostTransportState = when (code) {
+    "producer_unsupported", "producer_parked" -> HostTransportState.PRODUCER_UNSUPPORTED
+    "auth_rejected" -> HostTransportState.AUTH_REJECTED
+    "session_precondition_missing" -> HostTransportState.SESSION_PRECONDITION
+    // The same two pre-request refusals RnTransport.classify names — one
+    // mapping, so the Flutter binding never reads them as a network blip.
+    "bracket_unresolved", "bracket_marker_unreadable" -> HostTransportState.STORAGE_RECOVERY_BLOCKED
+    "erasure_requested" -> HostTransportState.ERASURE_PENDING
+    null -> HostTransportState.READY
+    else -> HostTransportState.PENDING_NETWORK
+}
+
+/**
+ * Who owes the retry for a finished drain.
+ *
+ * DERIVED FROM THE HOST STATE, NOT FROM `Disposition.RETRYABLE_REMAINING`.
+ * Auth uses that disposition internally — correctly, since a replaced
+ * credential delivers the same records — but the HOST contract deliberately
+ * treats AUTH_REJECTED as non-auto-retrying: the SDK must not spin against a
+ * credential only the app can fix. Scheduling from the disposition alone would
+ * quietly make auth auto-retry.
+ */
+fun retryOwedToWorker(state: HostTransportState): Boolean = when (state) {
+    // Transient and self-clearing: an opener may originate the session, a
+    // network may return.
+    HostTransportState.SESSION_PRECONDITION, HostTransportState.PENDING_NETWORK -> true
+    // A credential or a build fact. Neither clears by retrying.
+    HostTransportState.AUTH_REJECTED, HostTransportState.PRODUCER_UNSUPPORTED -> false
+    HostTransportState.READY, HostTransportState.NOT_CONFIGURED -> false
+    // Owed no automatic retry — the next OPEN retries recovery, and an erasure
+    // completes under the fence at the next open (as RnTransport rules).
+    HostTransportState.STORAGE_RECOVERY_BLOCKED, HostTransportState.ERASURE_PENDING -> false
+    // Local drain conditions, both transient in the same sense: the key or the
+    // file becomes readable again, or the lease holder releases. Owed a retry,
+    // because the alternative is a drain that could not look reporting itself
+    // finished — the F-6/F-42 loss class.
+    HostTransportState.QUEUE_UNREADABLE, HostTransportState.DRAIN_LEASE_BUSY -> true
+}

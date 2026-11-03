@@ -44,6 +44,7 @@ interface NativeBridge {
   hostReady(routeId: string, hostId: string): Promise<Outcome>;
   hostFailed(routeId: string, hostId: string): Promise<Outcome>;
   hostDetached(routeId: string, hostId: string): Promise<Outcome>;
+  identify(userId: string | null): Promise<Outcome>;
   state(): Promise<string>;
 }
 
@@ -159,6 +160,23 @@ export function hostDetached(routeId: string, hostId: string): Promise<Outcome> 
 }
 
 /**
+ * Name the end user this session belongs to.
+ *
+ * The value is validated natively and applied to the session the native
+ * identity supplier reports, so JavaScript cannot name a user on a session it
+ * is not running. Idempotent in effect: naming the same user twice re-applies
+ * the same value.
+ *
+ * A blank argument is refused rather than treated as a sign-out. Sign-out is
+ * not expressible through this field: the server merges a non-null identity,
+ * so an envelope naming no user does not clear a stored one, and clearing it
+ * only on the device would leave the two disagreeing with nothing saying so.
+ */
+export function identify(userId: string | null): Promise<Outcome> {
+  return call('identify', userId);
+}
+
+/**
  * The transport's current state. Status only: never the pending records and
  * never the credential.
  */
@@ -181,5 +199,6 @@ export default {
   hostReady,
   hostFailed,
   hostDetached,
+  identify,
   state,
 };

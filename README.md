@@ -173,6 +173,7 @@ it can only ever *reduce* what is captured.
 | `declareNeverRecord(routeId, never?)` | never record this route |
 | `hostAttached(routeId, hostId, rootHandle?)` | declare a capture-root owner |
 | `hostReadinessPending` / `hostReady` / `hostFailed` / `hostDetached` | host readiness |
+| `identify(userId)` | name the end user this session belongs to |
 | `state()` | transport state; status only, never records or credentials |
 
 Session identity, project, environment, protocol version, sequence numbers,
@@ -182,9 +183,15 @@ both clocks and the privacy posture are native and have no parameter to set.
 
 This is a prerelease, published under the `next` tag. A clean external React
 Native application has been built and launched with this package on both
-platforms, and every function in the API table above was called from
-JavaScript on a running device. See the repository for what each release was
-tested against.
+platforms, and every function in the API table above **except `identify`** was
+called from JavaScript on a running device.
+
+`identify` is new in this prerelease. It is declared by all four native and
+JavaScript surfaces, the Android library compiles with it exposed to the React
+bridge, and the native implementation it forwards to carries its own tests in
+the upstream SDK — but it has **not** yet been exercised from JavaScript on a
+device, so it is listed here as unvalidated rather than as tested. See the
+repository for what each release was tested against.
 
 ## License
 

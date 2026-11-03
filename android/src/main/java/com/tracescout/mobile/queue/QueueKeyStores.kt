@@ -42,6 +42,15 @@ import java.io.File
  * files the product does not own. The inventory scan is scoped to the shipped
  * modules for that reason, and the scope is asserted rather than assumed.
  *
+ * **THE IN-FLIGHT DESCRIPTORS ARE NOT MEMBERS, BY THEIR CONTENT.** Each
+ * producer's `InFlightStore` file (`tracescout-*-inflight.json`) is deliberately
+ * UNENCRYPTED metadata — which batch identity is unresolved — and carries no
+ * record content, so it is not a queue-key store and this inventory is not the
+ * list it belongs on. Adding it would also make the inventory's own definition
+ * false: every member here is a file the queue key makes unreadable, and that
+ * is exactly the property [clearAll] acts on. The teardown has no work to do
+ * for a plaintext descriptor.
+ *
  * **THE AUTHORITY'S OWN FILES ARE NOT MEMBERS EITHER, AND THAT IS RULING A1.**
  * `session-floors.bin`, the per-session snapshots and WALs live in the
  * `tracescout_authority_v2` domain under `AuthorityNaming.ROOT_DIR`. Destroying
@@ -98,6 +107,88 @@ object QueueKeyStores {
  */
     const val RN_FRAME_LOSS: String = "tracescout-rn-frame-loss.bin"
 
+    // ── the Flutter producer ─────────────────────────────────────────────────
+
+    /**
+ * The Flutter live queue. Separate from the Android and RN producers' by
+ * design — two producers sharing one queue would interleave their sequence
+ * counters and a whole-store batch could then never be contiguous.
+ */
+    const val FLUTTER_QUEUE: String = "tracescout-flutter-queue.bin"
+
+    /** Flutter parked records. */
+    const val FLUTTER_PARKED_RECORDS: String = "tracescout-flutter-parked.bin"
+
+    /** Flutter parked manifest. */
+    const val FLUTTER_PARKED_MANIFEST: String = "tracescout-flutter-parked-manifest.bin"
+
+    // ── queue-key-backed DIRECTORIES ─────────────────────────────────────────
+
+    /**
+ * The Flutter visual-frame custody directory, relative to `filesDir`.
+ *
+ * **A DIRECTORY IS DECLARED SEPARATELY FROM A FILE, AND MERGING THE TWO
+ * WOULD BE WORSE THAN THE GAP IT CLOSES.** Every member of [ALL] is cleared
+ * by `File(filesDir, name).delete`, which **FAILS on a non-empty
+ * directory** — so adding this name to [ALL] would make a *supported*
+ * teardown report [StoreTeardown.Cleanup.Incomplete] on every call for as
+ * long as one frame was held, i.e. a permanent false failure on the one path
+ * whose whole job is to report honestly. (`ErasureFlowTest` E9 relies on
+ * exactly that behaviour to *induce* an incomplete cleanup by turning an
+ * [ALL] member into a non-empty directory.) The two kinds therefore have two
+ * declarations and two cleanup mechanisms, and
+ * `QueueKeyStoreInventoryTest` requires every declared name to be in
+ * precisely one of them.
+ *
+ * **AND IT IS NOT MERELY A NAME — IT IS SWEPT BY [clearAll].** The frames
+ * under it are sealed with `StoreKeys.queueKey`, so they have the ONE
+ * property every member of this object has: destroying the queue key makes
+ * them unreadable. Before this declaration the directory was invisible to
+ * the teardown, so a completed erasure left per-frame ciphertext nothing can
+ * ever open again — the exact hazard [ALL]'s own note describes, reached
+ * through a shape that list cannot express.
+ *
+ * **IT IS A SINGLE PATH SEGMENT AND [clearOwnedFrameFiles] ENFORCES THAT.**
+ * A name carrying a separator or `.` would make the sweep's root a function
+ * of the name rather than of `filesDir`, which is the whole of its
+ * confinement argument.
+ */
+    const val FLUTTER_FRAMES_DIR: String = "tracescout-flutter-frames"
+
+    /**
+ * Every queue-key-backed production DIRECTORY, relative to `filesDir`.
+ *
+ * DISJOINT FROM [ALL] BY CONSTRUCTION, and the inventory scan asserts it:
+ * a name in both lists would be deleted as a file and then swept as a
+ * directory, so whichever mechanism ran second would report a failure for
+ * work the first one had already done correctly.
+ */
+    val ALL_DIRECTORIES: List<String> = listOf(FLUTTER_FRAMES_DIR)
+
+    /**
+ * ONE HOME for the naming rule of a content-addressed frame file.
+ *
+ * **NOT `const`, DELIBERATELY.** `QueueKeyStoreInventoryTest` derives the
+ * declared store names from `const val` declarations in this file and
+ * requires each to be a member of [ALL] or [ALL_DIRECTORIES]; a suffix
+ * fragment is neither, so making it `const` would either fail that row or
+ * force it to carry an exception list.
+ */
+    private val FRAME_SUFFIX: String = ".bin"
+
+    /**
+ * The content-address shape a frame file name carries.
+ *
+ * **A SECOND HOME FOR THIS SHAPE EXISTS AND THAT IS THE STATED COST OF
+ * THE NO-DEPENDENCY RULE.** `FrameContract.CONTENT_HASH` declares the same
+ * 64-character lowercase-hex rule in `flutter-bridge`, and `:sdk` may not
+ * depend on a producer module to learn it (the dependency points
+ * `:flutter ->:sdk`, never back). The divergence is made a TEST FAILURE
+ * rather than a discovery: `FlutterFrameCustodyTest` drives both predicates
+ * over the same vectors and requires them to agree.
+ */
+    private val FRAME_CONTENT_ADDRESS = Regex("^[0-9a-f]{64}$")
+
     /**
  * Every queue-key-backed production file, relative to `filesDir`.
  *
@@ -109,6 +200,7 @@ object QueueKeyStores {
         SDK_QUEUE, SDK_PARKED_RECORDS, SDK_PARKED_MANIFEST,
         RN_QUEUE, RN_PARKED_RECORDS, RN_PARKED_MANIFEST, RN_FRAMES,
         RN_FRAME_LOSS,
+        FLUTTER_QUEUE, FLUTTER_PARKED_RECORDS, FLUTTER_PARKED_MANIFEST,
     )
 
     /**
@@ -134,7 +226,135 @@ object QueueKeyStores {
             try { if (f.exists()) f.delete() } catch (_: Throwable) { /* verified below */ }
             if (f.exists()) failed.add(name) else cleared.add(name)
         }
+        // THE DIRECTORIES CONTRIBUTE TO `failed` ONLY, NEVER TO `cleared`,
+        // AND THAT ASYMMETRY IS DELIBERATE RATHER THAN AN OMISSION.
+        // `cleared` is the per-FILE-NAME outcome list, and two authority rows
+        // derive their EXPECTATION from `ALL` itself —
+        // `AuthorityKeyDomainTest.H3` asserts `done.cleared.toSet ==
+        // QueueKeyStores.ALL.toSet` and its `stuck` row asserts
+        // `ALL.filterNot { it == stuck }`. Adding a directory name to `cleared`
+        // would break both for a reason that has nothing to do with what they
+        // pin, so the directory sweep is silent on success and SPECIFIC on
+        // failure: each surviving frame file is named `<dir>/<file>`, which is
+        // what an operator needs to act on. A clean sweep of a directory that
+        // does not exist is likewise silent — it is idempotent, not an event.
+        for (name in ALL_DIRECTORIES) {
+            val sweep = clearOwnedFrameFiles(filesDir, name)
+            for (f in sweep.failed) failed.add("$name/$f")
+            // A refusal that is NOT "the directory is absent" means the sweep
+            // could not run at all, so nothing may claim those bytes are gone.
+            sweep.refusal?.let { if (it != REFUSAL_DIRECTORY_ABSENT) failed.add("$name ($it)") }
+        }
         return if (failed.isEmpty()) StoreTeardown.Cleanup.Done(cleared)
         else StoreTeardown.Cleanup.Incomplete(cleared, failed)
+    }
+
+    /** The file name a frame with [contentHash] is held under, or null if the hash is not one. */
+    fun ownedFrameFileName(contentHash: String): String? =
+        if (FRAME_CONTENT_ADDRESS.matches(contentHash)) contentHash + FRAME_SUFFIX else null
+
+    /**
+ * Is [name] a frame file THIS SDK owns?
+ *
+ * **DERIVED FROM THE NAMING RULE, NEVER FROM A LIST OF KNOWN EXCEPTIONS.**
+ * The custody directory holds more than frames: one `EncryptedEventStore`
+ * also creates the SHARED `QueueDomain.LOCK_FILE` beside its data file, which
+ * other writers in that directory coordinate through. Testing membership
+ * positively — a 64-character lowercase-hex content address plus the suffix —
+ * means the lock, a subdirectory, and anything a future slice puts there are
+ * excluded because they do not match, rather than because somebody
+ * remembered to list them.
+ */
+    fun isOwnedFrameFileName(name: String): Boolean =
+        name.endsWith(FRAME_SUFFIX) &&
+            FRAME_CONTENT_ADDRESS.matches(name.removeSuffix(FRAME_SUFFIX))
+
+    /** Why a sweep did not run, or the per-file outcome of one that did. */
+    data class FrameSweep(
+        val deleted: List<String>,
+        val failed: List<String>,
+        val refusal: String?,
+    )
+
+    /**
+ * The directory is not there, so there is nothing to clear. NOT a failure.
+ *
+ * Not `const`, for the same reason as [FRAME_SUFFIX]: the inventory scan
+ * reads every `const val` in this file as a declared STORE NAME and requires
+ * it to be a member of [ALL] or [ALL_DIRECTORIES]. A refusal code is
+ * neither, and making the guard carry an exception list for it would blunt
+ * the one check that catches a real new store.
+ */
+    val REFUSAL_DIRECTORY_ABSENT: String = "directory_absent"
+
+    /**
+ * Remove the frame files this SDK owns inside `filesDir/dirName`, and NOTHING
+ * ELSE — the ONE cleanup mechanism for a queue-key-backed directory.
+ *
+ * **PUBLIC, UNLIKE [clearAll], AND FOR A REASON THAT IS NOT CONVENIENCE.**
+ * `internal` is compilation-module scoped, so `:flutter` — a separate Gradle
+ * module — cannot see one. The producer that writes these frames needs the
+ * SAME semantics for its own `clear`, and the alternative is a second
+ * implementation of "which files are ours and how do we confine the sweep",
+ * which is the drift this whole object exists to prevent. It is safe to
+ * expose precisely because it deletes only content-addressed frame bytes
+ * that the owning producer may already discard one at a time; [clearAll]
+ * stays `internal` because it deletes the record queues, whose safety rests
+ * on the queue key being gone first.
+ *
+ * **ROOT-CONFINED, AND SYMLINKS ARE REFUSED IN BOTH DIRECTIONS.**
+ * * [dirName] must be a single path segment, so the root is a function of
+ * [filesDir] and not of the name.
+ * * the root's own canonical parent must BE `filesDir`'s canonical path — a
+ * root that is itself a symlink elsewhere is refused outright rather than
+ * swept at its target.
+ * * each entry's canonical parent must be the canonical root — a
+ * frame-NAMED symlink pointing outside is never deleted. It IS reported as
+ * failed, because something that looks like ours is still there and a
+ * `Done` would be a false claim.
+ *
+ * **THE DIRECTORY ITSELF IS NEVER REMOVED.** The shared lock may live in
+ * it, a concurrent writer may be holding it, and an empty directory stalls
+ * nothing — removing it would trade a harmless residue for a race.
+ *
+ * **SUCCESS IS RE-READ FROM THE FILE SYSTEM** — the same rule [clearAll]
+ * states: `delete` answers "did I unlink it", `exists` afterwards
+ * answers the question the caller actually has.
+ */
+    fun clearOwnedFrameFiles(filesDir: File, dirName: String): FrameSweep {
+        if (dirName.isEmpty() || dirName == "." || dirName == ".." ||
+            dirName.contains('/') || dirName.contains('\\')
+        ) {
+            return FrameSweep(emptyList(), emptyList(), "directory_name_unsafe")
+        }
+        val root = File(filesDir, dirName)
+        val canonicalRoot = try { root.canonicalFile } catch (_: Throwable) {
+            return FrameSweep(emptyList(), emptyList(), "directory_unresolvable")
+        }
+        if (!root.exists()) {
+            return FrameSweep(emptyList(), emptyList(), REFUSAL_DIRECTORY_ABSENT)
+        }
+        if (!root.isDirectory) {
+            return FrameSweep(emptyList(), emptyList(), "not_a_directory")
+        }
+        val canonicalParent = try { filesDir.canonicalFile } catch (_: Throwable) { null }
+        if (canonicalParent == null || canonicalRoot.parentFile != canonicalParent) {
+            return FrameSweep(emptyList(), emptyList(), "directory_escapes_root")
+        }
+        val entries = root.listFiles()
+            ?: return FrameSweep(emptyList(), emptyList(), "directory_unreadable")
+        val deleted = ArrayList<String>()
+        val failed = ArrayList<String>()
+        for (entry in entries) {
+            if (!isOwnedFrameFileName(entry.name)) continue
+            if (!entry.isFile) { failed.add(entry.name); continue }
+            val confined = try {
+                entry.canonicalFile.parentFile == canonicalRoot
+            } catch (_: Throwable) { false }
+            if (!confined) { failed.add(entry.name); continue }
+            try { entry.delete() } catch (_: Throwable) { /* verified below */ }
+            if (entry.exists()) failed.add(entry.name) else deleted.add(entry.name)
+        }
+        return FrameSweep(deleted, failed, null)
     }
 }

@@ -77,6 +77,37 @@ object RnTransport {
  * refuses until the governed teardown completes at a later open.
  */
         ERASURE_PENDING,
+
+        /**
+ * The record queue could not be READ, so this drain cannot say what it
+ * holds. Nothing was delivered, nothing was removed, and the obligation
+ * to deliver is RETAINED — see `readRecordsSafely`.
+ *
+ * DISTINCT FROM `READY` ON PURPOSE. `READY` asserts there is nothing
+ * left to deliver; this asserts we do not know. They differ only in the
+ * one direction that matters, because `READY` discards the obligation.
+ */
+        QUEUE_UNREADABLE,
+
+        /**
+ * This drain did not run at all: another holder owns the SHARED
+ * recovery lease, so the queue was never opened and this drain cannot
+ * say what it holds.
+ *
+ * DISTINCT FROM EVERY OTHER STATE BECAUSE IT IS NOT A DRAIN RESULT.
+ * The lease-refused path used to return `lastState` — the verdict of
+ * some EARLIER drain — so a refusal to look was reported as whatever
+ * the last attempt had found. When that was `READY`
+ * (`Outcome.DONE` ⇒ `Result.success`), WorkManager deleted the
+ * unique recovery work while the holder's drain was still in flight
+ * and could still die: the F-6 shape, one level up.
+ *
+ * The obligation is RETAINED. The holder may deliver, in which case the
+ * next attempt reads an empty queue and concludes `READY` honestly; or
+ * the holder may be killed, and then only the worker can recover those
+ * records.
+ */
+        DRAIN_LEASE_BUSY,
     }
 
     @Volatile private var store: EncryptedEventStore? = null
@@ -332,15 +363,13 @@ object RnTransport {
             }
             var ticket: LossAuthority.Ticket? = null
             synchronized(this) {
-                ticket = when (val a = h.beginAdmission("adm-" + java.util.UUID.randomUUID(), "", eventType)) {
-                    is LossAuthority.Admission.Owned -> a.ticket
-                    is LossAuthority.Admission.Refused -> {
-                        RecoveryTrace.log("rn_authority_refused", "why" to a.reason, "eventType" to eventType); return -1L
-                    }
-                    is LossAuthority.Admission.NotDurable -> {
-                        RecoveryTrace.log("rn_authority_refused", "why" to "not_durable:" + a.reason, "eventType" to eventType); return -1L
-                    }
-                }
+                // ONE CLAIM DOOR — the three-arm `when` used to be INLINE
+                // here, and the incident producer then wrote a second copy of
+                // it further down this file. `AuthorityOwnershipPinsTest`
+                // caught that (it requires exactly one `.beginAdmission(` per
+                // producer) and it was right to: two doors is two places a
+                // sequence can be minted for one queue. See `claimAdmission`.
+                ticket = claimAdmission(h, eventType, "rn_authority_refused") ?: return -1L
                 assigned = ticket!!.sequence
                 val bytes = build(assigned)
                 recordBytesLen = bytes.size.toLong()
@@ -581,8 +610,28 @@ object RnTransport {
         val cfg = RnSecureConfig.load(ctx) ?: return State.NOT_CONFIGURED
         val s = store ?: return State.NOT_CONFIGURED
         if (!RecoveryCoordinator.acquire(ctx)) {
+            // **NOT `lastState` — THAT IS THE F-42 DEFECT.** Returning the
+            // previous drain's verdict reports a refusal to LOOK as a statement
+            // about what the queue HOLDS, and `drainForWorker` then maps that
+            // stale verdict: `READY` ⇒ `Outcome.DONE` ⇒ `Result.success` ⇒
+            // WorkManager deletes the unique recovery work. The holder's drain
+            // is still in flight at that moment and can still be killed, so the
+            // obligation is discarded while the records are on disk — the F-6
+            // shape, reached through the lease rather than through a read.
+            //
+            // NOTHING SHARED IS MUTATED HERE, DELIBERATELY. The F-6 branch
+            // resets `lastPipelineDisposition` because it runs INSIDE the drain
+            // that owns the lease. This path does not own it: another drain is
+            // mid-flight and `settlePendingAfterDrain` reads that same field, so
+            // writing it would corrupt the holder's settle decision — a worse
+            // defect than the one being fixed. `drainForWorker` instead refuses
+            // to CONSULT the disposition on this path.
+            //
+            // `drainTailAt` is likewise left alone: the holder owns the drain
+            // tail, and closing it from here would cancel a deadline that
+            // belongs to a drain still running.
             RecoveryTrace.log("rn_lease_refused")
-            return lastState
+            return State.DRAIN_LEASE_BUSY
         }
         drainInFlight.set(true)
         try {
@@ -601,7 +650,63 @@ object RnTransport {
             // the tail opens BEFORE it; a non-empty read is not, so it closes
             // again and settle's re-read reopens it.
             drainTailAt.set(android.os.SystemClock.elapsedRealtime())
-            val records = s.readRecordsSafely()
+            val read = s.readRecordsSafely()
+            // UNREADABLE IS NOT EMPTY — the whole point of `readRecordsSafely`
+            // returning a typed result. Nothing was delivered and nothing was
+            // removed, so the obligation is RETAINED: this returns its own state,
+            // `drainForWorker` maps it to RETRY, and WorkManager keeps the unique
+            // work alive under its own bounded, jittered backoff.
+            //
+            // THE TAIL IS CLOSED HERE, exactly as it is for a NON-EMPTY read.
+            // an earlier change holds the tail open only for a read that PROVED the store
+            // empty — "an EMPTY read is this drain's final look at the store". A
+            // read that proved nothing must not claim that window.
+            //
+            // AND IT RETURNS BEFORE THE FINALIZING BRANCH BELOW. That branch
+            // keys off `records.isEmpty`, so reaching it with an unreadable
+            // queue would let a chunkless finality checkpoint be built for a
+            // session whose queue may still hold records — declaring an end over
+            // bytes we could not see.
+            // AN EXHAUSTIVE `when`, NOT A CAST. Kotlin does not narrow a
+            // sealed type by exclusion, so `read.records` after an `is
+            // Unreadable` early return does not compile — and the cast that
+            // would have made it compile is exactly what lets a THIRD
+            // `QueueRead` case inherit a decision nobody made for it. Here a
+            // third case fails to compile until it states its own.
+            val records = when (read) {
+                is QueueRead.Unreadable -> {
+                    drainTailAt.set(FlushSchedule.NO_DRAIN_TAIL)
+                    // **RESETTING A STALE FACT, WITHOUT WHICH THIS WHOLE FIX
+                    // DOES NOT HOLD.** `drainForWorker` consults
+                    // `when (lastPipelineDisposition)` BEFORE `when (st)`, and that
+                    // field is assigned in exactly ONE place — inside the pipeline
+                    // path below, which this return skips. So it would still carry
+                    // the PREVIOUS drain's outcome, and two of those return early:
+                    // TERMINAL_MOVED_AND_MORE_REMAIN -> DONE and
+                    // TERMINAL_MOVE_BLOCKED -> PERMANENT. The first is the exact
+                    // defect being removed here, and its trigger is ordinary: a
+                    // drain ends TERMINAL_MOVED_AND_MORE_REMAIN, `settle` requests
+                    // the continuation drain, and THAT read throws.
+                    //
+                    // THIS IS A RESET, NOT A FABRICATED PIPELINE RESULT. The
+                    // file refuses to invent an HTTP result to steer scheduling,
+                    // and the same rule applies here: the point is that a previous
+                    // drain's fact must not be read as this drain's, so the
+                    // decision falls through to `when (st)` — the only authority
+                    // for a drain that ran no pipeline. RETRYABLE_REMAINING is also
+                    // the most accurate value available: nothing was delivered, and
+                    // the condition can clear.
+                    //
+                    // `settlePendingAfterDrain` is NOT reached on this path (it
+                    // runs at the end of the pipeline path), so within this drain
+                    // the field has exactly one reader: `drainForWorker`.
+                    lastPipelineDisposition =
+                        DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
+                    RecoveryTrace.log("rn_queue_unreadable", "code" to read.code)
+                    return State.QUEUE_UNREADABLE
+                }
+                is QueueRead.Readable -> read.records
+            }
             // **THE EMPTY BRANCH IS NO LONGER A DEAD END WHEN A SESSION HAS
             // BEEN DECLARED OVER.** This `return` is exactly the reason
             // the R-2 chunkless finality checkpoint could not be produced by
@@ -815,6 +920,36 @@ object RnTransport {
             // Keep each value's arrow its own.
             DurableUploadPipeline.Disposition.RECONCILIATION_BLOCKED ->
                 FlushSchedule.DrainDisposition.TERMINAL_MOVE_BLOCKED
+            // **F-15. THESE TWO ARMS ARE WHY THE `:rn` AND
+            // `:flutter` MODULES COULD NOT COMPILE AGAINST THE PRESERVED STACK.**
+            // `:sdk` gained two Disposition members and this `when` is exhaustive
+            // with no `else` — deliberately, so a new member cannot be silently
+            // mapped to a default. The local `:sdk` suite never compiles these
+            // modules, so only a real CI run could find it; it did.
+            //
+            // The mapping follows the scheduler's OWN vocabulary rather than
+            // inventing a class: `RETRYABLE_REMAINING` is documented as "the head
+            // is retained by a TRANSIENT refusal … the worker's own bounded,
+            // jittered backoff owns this retry", which is exactly an F-15 carrier
+            // fault, an unacknowledged 2xx, an unreadable authority or a cooling
+            // burst — each of which a later drain may find different, and none of
+            // which wants a second deadline armed beside that backoff. That is
+            // also the mechanism by which a cooled burst is retried at all.
+            DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED ->
+                FlushSchedule.DrainDisposition.RETRYABLE_REMAINING
+            // A DEFINITE server answer that settled nothing. `TERMINAL_MOVE_BLOCKED`
+            // is this file's established "bytes retained, no automatic retry at
+            // all" bucket — it already carries PROTECTION_UNAVAILABLE,
+            // NO_PROGRESS_BOUND, BRACKET_UNRESOLVED, ERASURE_REQUESTED and
+            // RECONCILIATION_BLOCKED for the same reason: no schedule can change
+            // the state. An ordinary local change still requests a drain.
+            //
+            // EACH VALUE KEEPS ITS OWN ARROW, per this file's own rule: a
+            // frozen source pin can match a literal arrow, so folding values into
+            // a shared arm deletes the arrow a pin reads while leaving the
+            // contract it states untouched.
+            DurableUploadPipeline.Disposition.F15_CHECKPOINT_BLOCKED ->
+                FlushSchedule.DrainDisposition.TERMINAL_MOVE_BLOCKED
         }
 
     private fun settlePendingAfterDrain(ctx: Context) {
@@ -823,7 +958,21 @@ object RnTransport {
         // this read is the one nothing else can cover.
         drainTailAt.set(android.os.SystemClock.elapsedRealtime())
         val remaining = try {
-            s.readAll().records.size
+            val r = s.readAll()
+            // THE SAME RULE AS `readRecordsSafely`, and the deadline re-arm's
+            // own KDoc already promises it: "An unreadable store is treated as
+            // NON-EMPTY … assuming empty would strand records we could not
+            // see." Reporting `0` from an untrustworthy EMPTY read is exactly
+            // that assumption, and `onDrainSettled` would then reset the
+            // counters and arm nothing. Narrow in the same way: a NON-EMPTY
+            // damaged read reports its real count, whose discards are already
+            // accounted by `discarded` / `discardReasons`.
+            if (r.records.isEmpty() && !r.isTrustworthy) {
+                RecoveryTrace.log("rn_pending_settle_unreadable", "class" to r.integrityClass)
+                -1
+            } else {
+                r.records.size
+            }
         } catch (_: Throwable) {
             RecoveryTrace.log("rn_pending_settle_unreadable")
             -1
@@ -925,6 +1074,145 @@ object RnTransport {
  * refused crash evidence and quarantined it.
  */
     /**
+ * The queue home's store, for the CRASH path only.
+ *
+ * WHY A SEAM AND NOT `enqueue`. `enqueue` takes the governed eviction
+ * bracket — `QueueRegion.BRACKET`, `Acquisition.SERIALIZE` — whose budget is
+ * seconds, and a dying thread must never queue behind another process's
+ * bracket. The crash-region append (`QueueRegion.CRASH_APPEND`,
+ * `Acquisition.BOUNDED`, a few tens of milliseconds, typed refusal) is
+ * `internal` to `:sdk` by a deliberate decision recorded in its own KDoc —
+ * "a region argument would let any caller claim the crash budget" — so it
+ * is NOT widened here. [RnIncidentCapture] hands this store to the public
+ * `CrashHandler.install`, which performs that append from inside `:sdk`.
+ * One crash-region append in the SDK, reached by two record builders.
+ *
+ * IT IS THE RN QUEUE, not the Android producer's. Two producers sharing
+ * one file would interleave their sequence counters and a whole-store batch
+ * could never be contiguous.
+ */
+    internal fun storeForIncidents(ctx: Context): EncryptedEventStore {
+        val app = ctx.applicationContext
+        return store ?: openStore(app).also { store = it }
+    }
+
+    /**
+ * Claim a durable sequence for an incident record, from the authority of the
+ * session that is ALREADY running.
+ *
+ * IT LIVES HERE BECAUSE A MODULE-BOUNDARY GUARD SAID SO, AND THE GUARD
+ * WAS RIGHT. `ModuleBoundaryTest.B9` enumerates every `beginAdmission(`
+ * call site and the RN half of that enumeration is THIS FILE. The first
+ * version of the incident producer claimed its own admission from
+ * `RnIncidentCapture`, which made it a third caller — and the guard caught
+ * it. Re-pointing the enumeration would have been the wrong repair: the
+ * claim and its SETTLEMENT (directly below) are one fact, and they were
+ * split across two files. One home.
+ *
+ * `LossAuthority.peek`, NEVER `open`. `open` reconstructs the authority
+ * by reading the ENTIRE queue (`store.readAll`) — seconds of I/O on a
+ * thread racing the process's death. The authority is already open for a
+ * session that has been running, so `peek` answers from memory; if it
+ * cannot, there is no claim to be had.
+ *
+ * @return the owned ticket, or null when there is no authority or the
+ * authority refuses. The caller must NOT append without one: a record
+ * carrying a sequence the authority does not own is unaccounted loss.
+ */
+    internal fun beginIncidentAdmission(
+        ctx: Context,
+        sessionId: String,
+        eventType: String,
+    ): LossAuthority.Ticket? {
+        val app = ctx.applicationContext
+        val handle = LossAuthority.peek(app.filesDir, sessionId) ?: run {
+            RecoveryTrace.log("rn_incident_admission_no_authority", "eventType" to eventType)
+            return null
+        }
+        return claimAdmission(handle, eventType, "rn_incident_admission_refused")
+    }
+
+    /**
+ * THE ONE PLACE AN RN RECORD'S ADMISSION IS CLAIMED.
+ *
+ * `AuthorityOwnershipPinsTest` requires exactly ONE `.beginAdmission(`
+ * call site per producer file, and the invariant is real rather than
+ * stylistic: a second claim door is a second place a sequence can be
+ * minted against one queue, so the loss ledger would have two independent
+ * sources for one fact. The first version of the incident producer above
+ * inlined its own copy of the three-arm `when` — a second door — and the
+ * guard failed. Re-pointing the guard would have been the wrong repair.
+ *
+ * The two callers differ in exactly two things, and both are parameters
+ * rather than reasons to duplicate the claim: WHERE the handle comes from
+ * (`enqueue` resolves or opens one; the incident path `peek`s one that
+ * must already exist, because `open` would read the whole queue on a
+ * thread racing the process's death) and WHICH trace name a refusal is
+ * reported under.
+ *
+ * @return the owned ticket, or null when the authority refuses. A caller
+ * must NOT append without one: a record carrying a sequence the
+ * authority does not own is unaccounted loss.
+ */
+    private fun claimAdmission(
+        handle: LossAuthority.Handle,
+        eventType: String,
+        refusedEvent: String,
+    ): LossAuthority.Ticket? =
+        when (val a = handle.beginAdmission("adm-" + java.util.UUID.randomUUID(), "", eventType)) {
+            is LossAuthority.Admission.Owned -> a.ticket
+            is LossAuthority.Admission.Refused -> {
+                RecoveryTrace.log(refusedEvent, "why" to a.reason, "eventType" to eventType)
+                null
+            }
+            is LossAuthority.Admission.NotDurable -> {
+                RecoveryTrace.log(
+                    refusedEvent, "why" to "not_durable:" + a.reason, "eventType" to eventType,
+                )
+                null
+            }
+        }
+
+    /**
+ * Settle a crash record's admission with the SAME three states every other
+ * append is settled with.
+ *
+ * THREE STATES, NOT TWO. Collapsing `stored && COMMITTED` into one
+ * boolean turned `stored = true` with an INDETERMINATE directory entry —
+ * bytes that may well be on disk — into a durable FALSE LOSS for a record
+ * the next launch would then upload. An indeterminate append settles
+ * NOTHING here; the next open reconciles it against what is genuinely on
+ * disk.
+ *
+ * The handle is resolved from the TICKET's own session id, so this cannot
+ * settle a ticket against the wrong session's authority.
+ */
+    internal fun settleIncidentAppend(
+        ctx: Context,
+        ticket: LossAuthority.Ticket,
+        stored: Boolean,
+        durability: EncryptedEventStore.Durability,
+    ) {
+        val app = ctx.applicationContext
+        val h = LossAuthority.peek(app.filesDir, ticket.sessionId) ?: run {
+            RecoveryTrace.log(
+                "rn_incident_settle_no_authority",
+                "sequence" to ticket.sequence, "eventType" to ticket.eventType,
+            )
+            return
+        }
+        when {
+            stored && durability == EncryptedEventStore.Durability.COMMITTED ->
+                h.settleAdmitted(ticket)
+            !stored -> h.settleLost(ticket, LossAuthority.Cause.APPEND_REFUSED)
+            else -> RecoveryTrace.log(
+                "rn_incident_settle_deferred",
+                "sequence" to ticket.sequence, "durability" to durability.name,
+            )
+        }
+    }
+
+    /**
  * UAT-ONLY: read the durable queue through the PRODUCTION decrypt path.
  *
  * IT USES `EncryptedEventStore.readAll`, the same function the uploader
@@ -1008,8 +1296,79 @@ object RnTransport {
             ParkStatus(0, 0, 0L)
         }
 
-    private fun EncryptedEventStore.readRecordsSafely(): List<ByteArray> =
-        try { readAll().records } catch (_: Throwable) { emptyList() }
+    /**
+ * The queue read, with "could not read" kept DISTINCT from "nothing here".
+ *
+ * **THIS USED TO RETURN `emptyList` ON A THROW, AND THAT DISCARDED
+ * THE OBLIGATION TO DELIVER RECORDS THAT WERE STILL ON DISK.** Its only
+ * caller is the drain decision, and the chain was: unreadable ⇒ empty ⇒
+ * `State.READY` ⇒ `drainForWorker` maps READY to `Outcome.DONE` ⇒ `doWork`
+ * turns DONE into `Result.success`, which marks the unique work SUCCEEDED
+ * so WorkManager DELETES it. The records survive on disk, nothing is
+ * scheduled to deliver them, and no loss is accounted — neither delivered
+ * nor accounted, which is precisely what the loss contract forbids.
+ *
+ * THE RULE IS NOT INVENTED HERE, AND THE NATIVE PRODUCER IS NOT THE
+ * REFERENCE FOR IT. `RecoveryWorker.undeliveredRecordBytes` asks this exact
+ * question and answers it the other way — it reports an unreadable queue as
+ * PRESENT (`1L`) because *"the question being asked is 'may I discard the
+ * obligation to deliver', and the only safe answer to 'I cannot tell' is
+ * no"*. This file already applies that rule to two sibling paths: the
+ * deadline re-arm (*"An unreadable store is treated as NON-EMPTY … Unknown
+ * is never evidence of nothing"*) and `settlePendingAfterDrain`, which logs
+ * `rn_pending_settle_unreadable` and returns `-1` rather than `0`.
+ * `TraceScoutMobile`'s start-time recovery still conflates the two (it logs
+ * a distinct `queue_read_failed` and then takes the empty branch); that is
+ * recorded for the owning lane, not copied here.
+ *
+ * NOTHING IS DELETED, REPAIRED OR CLEARED. An unreadable queue file is
+ * ciphertext this process cannot currently decrypt — not proven garbage —
+ * so the bytes are left exactly as they are for a later open to recover.
+ *
+ * `Throwable`, as before. An `Error` (OOM) reported as "unreadable" is a
+ * loose LABEL, but it reaches the same RETAIN decision, and narrowing to
+ * `Exception` would let an Error escape a drain whose lease is released in
+ * a `finally` — a wider change than the defect being fixed.
+ */
+    private sealed interface QueueRead {
+        /** The read SUCCEEDED. `records` may legitimately be empty. */
+        data class Readable(val records: List<ByteArray>) : QueueRead
+
+        /** The read THREW. The queue may hold anything, records included. */
+        data class Unreadable(val code: String) : QueueRead
+    }
+
+    private fun EncryptedEventStore.readRecordsSafely(): QueueRead =
+        try {
+            val r = readAll()
+            // `readAll` CAN RETURN AN UNTRUSTWORTHY RESULT WITHOUT THROWING,
+            // so the catch above is not the only route into this defect. An
+            // EMPTY read that is not trustworthy (`store_unreadable`, a torn
+            // tail that yielded nothing) is indistinguishable from a clean empty
+            // queue, and the empty branch is what RELEASES the obligation.
+            //
+            // NARROW ON PURPOSE — "every untrustworthy read is unreadable"
+            // would be WORSE THAN THE DEFECT. `readAll` recovers what it can:
+            // a result with `discarded > 0` returns the SURVIVING records, and
+            // those discards are already accounted (`discarded` /
+            // `discardReasons`, "counted, never silent"). Diverting that case
+            // here would strand every record the store did recover, in order to
+            // report damage the loss channel has already reported. So a
+            // NON-EMPTY read stays readable however damaged; only an empty one
+            // that cannot be trusted is refused.
+            if (r.records.isEmpty() && !r.isTrustworthy) {
+                // `integrityClass` is the one-word cross-platform vocabulary
+                // (`unreadable_file`, `auth_failure`, `torn_tail`, …) — a class
+                // of damage, never a path or a Keystore alias.
+                QueueRead.Unreadable(r.integrityClass)
+            } else {
+                QueueRead.Readable(r.records)
+            }
+        } catch (t: Throwable) {
+            // The exception CLASS only — a message can name a Keystore alias or
+            // a file path, and this trace is read by operators.
+            QueueRead.Unreadable(t.javaClass.simpleName)
+        }
 
     /**
  * The WorkManager entry point. NEVER retries a producer/auth refusal —
@@ -1040,6 +1399,18 @@ object RnTransport {
         // Slice D: owed no automatic retry — the next OPEN retries recovery,
         // and an erasure completes under the fence at the next open.
         State.STORAGE_RECOVERY_BLOCKED, State.ERASURE_PENDING -> false
+        // The queue could not be read, so records may still be there. RETAIN:
+        // this belongs with the transient class, not with Slice D's two. Slice D
+        // declines a schedule because only the next OPEN can conclude a bracket
+        // or an erasure; a READ has no such restriction — the very next drain can
+        // succeed once the key or the file is available again.
+        State.QUEUE_UNREADABLE -> true
+        // Another holder owns the lease, so this attempt never looked. Transient
+        // and self-clearing in the same sense as the two above: the holder
+        // releases, and the very next drain can read and deliver. `false` here
+        // would be `start` discarding the obligation precisely when it could
+        // not discharge it.
+        State.DRAIN_LEASE_BUSY -> true
     }
 
     private fun handOffRetryObligation(ctx: Context, state: State) {
@@ -1053,6 +1424,21 @@ object RnTransport {
     private fun drainForWorker(ctx: Context): RecoveryWorker.Outcome {
         val st = drainOnce(ctx)
         lastState = st
+        // **A DRAIN THAT NEVER RAN HAS NO PIPELINE FACT, SO THE BLOCK BELOW
+        // MUST NOT BE CONSULTED.** `lastPipelineDisposition` is assigned in
+        // exactly one place — inside the pipeline path — which a lease refusal
+        // never reaches, so the field still carries the PREVIOUS drain's outcome
+        // and two of those return early: TERMINAL_MOVED_AND_MORE_REMAIN -> DONE
+        // and TERMINAL_MOVE_BLOCKED -> PERMANENT. Either would discard the
+        // obligation on the word of a drain that did not happen.
+        //
+        // The F-6 branch solved the same hazard by RESETTING the field, which is
+        // safe there because that drain owns the lease. Here another drain is
+        // mid-flight and reads that field, so the only safe move is to not read
+        // it: refuse, retain, and let the worker's own bounded jittered backoff
+        // look again. RETRY is the only outcome that RETAINS — DONE deletes the
+        // unique work and PERMANENT fails it just as finally.
+        if (st == State.DRAIN_LEASE_BUSY) return RecoveryWorker.Outcome.RETRY
         // THE WORKER'S RETRY DECISION MUST COME FROM THE PIPELINE, NOT FROM
         // THE HTTP RESULT — and this gap could strand data.
         //
@@ -1095,6 +1481,38 @@ object RnTransport {
                 // The retried drain resumes the park from the persisted
                 // terminal descriptor and performs ZERO network requests.
                 return RecoveryWorker.Outcome.RETRY
+            // **F-15 IS DELIBERATELY NOT GIVEN AN ARM HERE, AND THE
+            // REASON IS A MEASUREMENT THAT REVERSED A REVIEW SUGGESTION.**
+            // CodeRabbit #4455080099 asked for `F15_CHECKPOINT_BLOCKED ->
+            // PERMANENT` and `F15_CHECKPOINT_RETRY_OWED -> RETRY` here, on the
+            // ground that a blocked F-15 drain otherwise reaches the retry
+            // result through `PENDING_NETWORK`. Both halves were driven, and
+            // both are wrong for this file:
+            //
+            // 1. `FlutterQueueFailureTest` pins that EXACTLY THREE
+            // dispositions may speak before the state and that "every
+            // OTHER disposition must let the state decide". The
+            // RETRY_OWED arm broke it outright (expected PERMANENT under
+            // STORAGE_RECOVERY_BLOCKED, got RETRY), and the BLOCKED arm
+            // would have PASSED only because both answers coincide for
+            // that one state — a guard satisfied by the harm it guards
+            // against.
+            // 2. PERMANENT is `Result.failure`: it ABANDONS the
+            // WorkManager obligation. The F-15 decline latch and the
+            // carrier burst are PROCESS-LOCAL, so a later launch would
+            // have tried again — which makes abandoning the obligation
+            // strictly worse than the fallthrough.
+            //
+            // What the fallthrough actually does: a local F-15 refusal reaches
+            // `PENDING_NETWORK -> RETRY`, the worker's own bounded, jittered
+            // backoff re-drains, and each re-drain re-asks the gate, which
+            // answers `carrier_declined` and makes NO REQUEST. So it is not a
+            // request loop — it is a backed-off local re-drain that posts
+            // nothing and RETAINS everything, which is the contract
+            // `F15_CHECKPOINT_BLOCKED` documents. A dedicated host state
+            // meaning "F-15 blocked" would be the clean answer and is a
+            // vocabulary change across both transports, named here rather than
+            // smuggled in.
             DurableUploadPipeline.Disposition.TERMINAL_MOVED_AND_MORE_REMAIN ->
                 // The queue advanced and `settlePendingAfterDrain` already
                 // requested the immediate continuation; a worker retry of the
@@ -1115,6 +1533,28 @@ object RnTransport {
             // Slice D: no schedule can conclude a bracket or complete an
             // erasure; both are retried at the next OPEN, never by the worker.
             State.STORAGE_RECOVERY_BLOCKED, State.ERASURE_PENDING -> RecoveryWorker.Outcome.PERMANENT
+            // RETRY, NEVER DONE AND NEVER PERMANENT. DONE is what this fix
+            // exists to remove: it marks the unique work SUCCEEDED, so
+            // WorkManager deletes the obligation while the records are still on
+            // disk. PERMANENT would abandon it just as finally (`Result.failure`).
+            // RETRY is the only outcome that RETAINS.
+            //
+            // WHAT THIS DOES NOT DO, stated because the rule this follows
+            // states it too: retrying an unchanged state never DELIVERS. If the
+            // queue is permanently unreadable, every attempt re-reads, fails and
+            // backs off (WorkManager caps at five hours between attempts) and the
+            // records stay undelivered. It is strictly better than DONE, which
+            // DELETED the obligation and left no trace; it is not a complete
+            // answer to "a record that is enqueued must reach a drain". The
+            // `rn_queue_unreadable` trace with its exception class is what makes
+            // the residual visible instead of silent.
+            State.QUEUE_UNREADABLE -> RecoveryWorker.Outcome.RETRY
+            // UNREACHABLE BY THE EARLY RETURN ABOVE, AND STATED ANYWAY. The
+            // `when` is exhaustive over the sealed enum, so this arm is what
+            // makes the early return's absence a COMPILE error rather than a
+            // silent fall-through to someone else's branch if a later edit moves
+            // or deletes it. It must agree with that return: RETRY, never DONE.
+            State.DRAIN_LEASE_BUSY -> RecoveryWorker.Outcome.RETRY
         }
     }
 
