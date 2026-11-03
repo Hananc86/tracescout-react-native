@@ -20,6 +20,19 @@ import collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from comments import comment_spans, strip_comments  # noqa: E402
 
+# The third-party product names the publish gate blocks. Imported, never
+# restated: a second copy of this list is a second thing to keep in step, and
+# the cleaner silently lacking a name the gate refuses is a tree that cannot
+# be published and no tool can repair.
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    '_prepublish_check',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prepublish-check.py'))
+_gate = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_gate)
+_COMPETITORS = next(p for n, p in _gate.CLASSES if n == 'competitor name')
+
 EXTS = ('kt', 'swift', 'ts', 'js', 'm', 'h', 'podspec')
 
 # Ordered: earlier rules may create text a later rule tidies.
@@ -64,6 +77,31 @@ RULES = [
     (r"\bHanan's\b", "the maintainer's", 'private'),
     (r'\b(?:Hanan|HANAN)\b', 'the maintainer', 'private'),
     (r'\bNorthstar\b', 'the development fixture', 'private'),
+
+    # --- third-party products named by name --------------------------------
+    # The publish gate BLOCKS these, so without a rule here the export path
+    # cannot produce a publishable tree for a source file that names one: the
+    # gate would refuse a file the cleaner has no way to fix. The vocabulary is
+    # imported from the gate rather than restated, so the two cannot drift --
+    # which is how this gap appeared in the first place.
+    #
+    # An enumeration collapses to ONE neutral phrase. Rewriting each name
+    # separately would leave "or a third-party reporter, or a third-party
+    # reporter, or a third-party reporter", which says less than the original.
+    #
+    # FIRST, the orphan. The walker gives every `//` line its own span, so no
+    # rule can see a phrase that spans two comment lines -- and a vendor
+    # qualifier stranded at the end of one line, with the product name it
+    # qualifies on the next, is the shape that occurs. Dropping the orphan
+    # while keeping its connective is what lets the following line's
+    # neutralisation read as continuous prose. Scoped to the hanging-qualifier
+    # shape, so a sentence that legitimately ends in a vendor name is left be.
+    (r'(\b(?:or|and)\s+)(?:Firebase|Google)[ \t]*$', r'\1', 'competitor'),
+    (r'(?:\b(?:Firebase|Google)\s+)?' + _COMPETITORS
+     + r'(?:\s*,?\s*(?:or|and)\s+(?:\b(?:Firebase|Google)\s+)?' + _COMPETITORS + r')+',
+     'a third-party reporter', 'competitor'),
+    (r'(?:\b(?:Firebase|Google)\s+)?' + _COMPETITORS,
+     'a third-party reporter', 'competitor'),
 
     # --- tidy what removal left behind ------------------------------------
     (r'^(\s*(?:///?|\*|/\*\*?)\s*)—\s*', r'\1', 'tidy'),

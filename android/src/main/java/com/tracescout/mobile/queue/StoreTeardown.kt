@@ -194,7 +194,15 @@ object StoreTeardown {
             !q -> Cleanup.NotAttempted("queue_key_not_destroyed")
             filesDir == null -> Cleanup.NotAttempted("files_dir_unavailable")
             else -> runCatching { QueueKeyStores.clearAll(filesDir) }
-                .getOrElse { Cleanup.Incomplete(emptyList(), QueueKeyStores.ALL) }
+                // THE DIRECTORIES BELONG IN THIS LIST TOO. A throw out of the
+                // cleanup means NOTHING was cleared, so naming only the FILE
+                // inventory would under-report an erasure failure — the
+                // queue-key-backed directories are equally untouched, and a
+                // caller reading `failed` is deciding what still has to be
+                // dealt with.
+                .getOrElse {
+                    Cleanup.Incomplete(emptyList(), QueueKeyStores.ALL + QueueKeyStores.ALL_DIRECTORIES)
+                }
         }
         return Outcome(queueDestroyed = q, authorityDestroyed = a, cleanup = cleanup)
     }

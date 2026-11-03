@@ -67,6 +67,19 @@ object WebViewBridge {
     fun newSegmentId(): String = UUID.randomUUID().toString().replace("-", "").take(32)
 
     /**
+ * Whether [s] is a well-formed segment id.
+ *
+ * THE ONE READER OF [SEGMENT_ID]. [handle] asks it, and so does
+ * `WebViewPageIdentity`, which interpolates an id into script source and
+ * needs the same answer — the alphabet this pattern admits is exactly what
+ * makes that interpolation safe. Restating the pattern at a second site is
+ * how two sites start disagreeing about one identifier, and the identifier
+ * is the whole join.
+ */
+    @JvmStatic
+    fun isSegmentId(s: String?): Boolean = s != null && SEGMENT_ID.matcher(s).matches()
+
+    /**
  * Handle one inbound bridge message.
  *
  * [expectedSegmentId] and [nativeSessionId] are held by the NATIVE side. A
@@ -138,7 +151,7 @@ object WebViewBridge {
 
         val claimed = fields["segmentId"] as? String
             ?: return Result.Refused("segment_id_missing")
-        if (!SEGMENT_ID.matcher(claimed).matches()) return Result.Refused("segment_id_invalid")
+        if (!isSegmentId(claimed)) return Result.Refused("segment_id_invalid")
         // The page cannot address a segment the native side did not open.
         if (claimed != expectedSegmentId) return Result.Refused("segment_id_mismatch")
 

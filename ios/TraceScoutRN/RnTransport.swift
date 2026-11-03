@@ -252,6 +252,7 @@ public final class RnTransport {
         // repeated here; this only hands the already-installed observer its
         // real authority and its real destination.
         configureNetworkObserver()
+        configureIncidentObserver()
         // The persisted native opt-in is applied HERE and nowhere else, so a
         // cold launch honours what the host app last decided. Absent == false:
         // this line can only ever turn capture on when the host app said so.
@@ -341,10 +342,70 @@ public final class RnTransport {
             epochToken: "\(a.identity.sessionId)#\(networkEpochCounter)#\(a.generation)")
     }
 
+    /// Hand the incident observer its real identity, posture and destination.
+    ///
+    /// CALLED FROM `start`, LIKE `configureNetworkObserver`, AND
+    /// IDEMPOTENT BY CONSTRUCTION — `RnIncidentObserver.install` refuses a
+    /// second install, because registering the exception handler twice would put
+    /// our own handler in its own chain and write the crash record twice.
+    ///
+    /// CRASH AND HANG CAPTURE ARE **NOT** BEHIND THE NETWORK OPT-IN, and
+    /// that is deliberate. The network opt-in gates capture of request
+    /// METADATA — URLs and headers a user may consider private. A crash record
+    /// carries a class name, a thread name and symbol strings and no
+    /// application-supplied value at all (the exception's `reason` is excluded
+    /// precisely because that is where interpolated values live), so there is no
+    /// privacy decision for an operator to make and nothing for a flag to
+    /// protect. A crash reporter a host must find and enable is a crash reporter
+    /// nobody enables, and the first thing anyone wants after a crash is the
+    /// crash.
+    ///
+    /// It is still gated on a LIVE SESSION: the provider returns nil when
+    /// none is running, and the observer treats that as "do not emit" rather
+    /// than inventing an identity the server would refuse `404
+    /// session_not_found`.
+    private func configureIncidentObserver() {
+        RnIncidentObserver.install(context: RnIncidentObserver.Context(
+            identity: { RnTransport.shared.currentIdentity() },
+            // A crash or a hang describes a process, not a view tree: there is
+            // no captured view to count and nothing to declare never-record
+            // about. The SAME reasoning, and the same values, as
+            // `appendNetworkEvent`.
+            posture: { RnEnvelope.Posture(allowedViewCount: 0, screenNeverRecord: false) },
+            // THE SAME TIMELINE THE NETWORK OBSERVER READS, asked for NOW.
+            // There is no separate "current route" field on this transport, and
+            // adding one would be a second answer to "which screen is live"
+            // that could disagree with the timeline exactly once. `screen(at:)`
+            // answers from the route history for the instant given, so the
+            // incident is attributed to the screen that was live when it
+            // happened rather than to whatever a mutable field last held.
+            screenId: {
+                RnTransport.shared.screenAtMonotonic(Int64(DispatchTime.now().uptimeNanoseconds))
+            },
+            // The transport's OWN enqueue: the sequence is assigned and the
+            // record appended inside the single existing critical section, and
+            // the append ends in `synchronize` — an `fsync(2)` — so a record
+            // reported stored survives the process kill a crash is racing.
+            // There is no incident-specific store, sequence generator or
+            // uploader.
+            append: { build in RnTransport.shared.enqueue(build) },
+            requestDrain: { reason in RnTransport.shared.requestDrain(reason: reason) }))
+    }
+
     /// CALLED FROM `start` AND NOWHERE ELSE. It is idempotent by
-    /// construction — it replaces two closures — and it installs no selector:
-    /// installation is the image-load concern, and a second start must not
-    /// add a second method to React Native's class.
+    /// construction — it replaces three closures (`authority`, `sink`,
+    /// `screenAt`) — and it installs no selector: installation is the
+    /// image-load concern, and a second start must not add a second method to
+    /// React Native's class.
+    ///
+    /// THIS BLOCK WAS ORPHANED BY THE G1 INSERTION AND IS RESTORED HERE.
+    /// `configureIncidentObserver` was added directly beneath it, so Swift
+    /// attached it to THAT function — which made it describe something it does
+    /// not do (the incident observer hands over FIVE closures and installs
+    /// nothing by selector) and left this one undocumented. Found by review; the
+    /// closure count was also wrong before the move (two, where
+    /// `RnNetworkObserver.configure` stores three), so it is corrected rather
+    /// than merely relocated.
     private func configureNetworkObserver() {
         RnNetworkObserver.configure(
             authority: { RnTransport.shared.networkAuthority() },
@@ -437,6 +498,45 @@ public final class RnTransport {
         lock.lock(); defer { lock.unlock() }
         guard let a = active, a.openerDurable, a.generation == generation else { return nil }
         return a.identity
+    }
+
+    /// **THE OWNER'S STORE for the identified user (G2).** `RnBridge.identify`
+    /// DECIDES; this STORES — it receives only an already-ACCEPTED value and
+    /// applies no policy of its own. Validation, the 256-code-point bound, the
+    /// blank-is-a-refusal rule and the disclosure that never carries the value
+    /// all live in `IdentityPolicy`/`RnBridge`; duplicating any of them here
+    /// would give one rule two homes that can disagree, and the Kotlin twin
+    /// would then be agreeing with the wrong one.
+    ///
+    /// IT ENFORCES THE SAME INVARIANT AS `currentIdentity`, deliberately
+    /// spelled out rather than shared through a helper, because a stamp that
+    /// admitted a session the READ refuses would address an identity to a
+    /// session no event can carry: opener durably established AND belonging to
+    /// the current store generation.
+    ///
+    /// IT IS NOT A PUBLICATION. `publishSession` resets the screen timeline,
+    /// marks the registry pending and begins the capture log — correct when a
+    /// session STARTS and wrong here, where the session is already running and
+    /// only learned its user's name. Only the identity moves.
+    ///
+    /// - Returns: whether a live session actually took the value — never a
+    /// silent success. `false` is the race the bridge's `NO_SESSION` names.
+    public func applyUserId(_ accepted: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let a = active, a.openerDurable, a.generation == generation else { return false }
+        let id = a.identity
+        active = ActiveSession(
+            identity: RnEnvelope.Identity(projectId: id.projectId,
+                                          sessionId: id.sessionId,
+                                          anonymousId: id.anonymousId,
+                                          environment: id.environment,
+                                          appIdentifier: id.appIdentifier,
+                                          initialScreen: id.initialScreen,
+                                          userId: accepted),
+            openerDurable: a.openerDurable,
+            generation: a.generation,
+            startedMonotonicNanos: a.startedMonotonicNanos)
+        return true
     }
 
     /// Mint a CANDIDATE session identity. Deliberately does NOT publish it:

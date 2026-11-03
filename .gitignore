@@ -5,3 +5,4 @@ android/build/
 android/.cxx/
 ios/build/
 .DS_Store
+__pycache__/

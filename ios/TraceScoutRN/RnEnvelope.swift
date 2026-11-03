@@ -66,16 +66,37 @@ public enum RnEnvelope {
         public let appIdentifier: String
         /// The route the session opened on. Native, from the first record.
         public let initialScreen: String?
+        /// The IDENTIFIED USER (G2), as the host app named it through
+        /// `identify`. Nil until it does — and nil is ANONYMOUS, which is a
+        /// fact, not a gap.
+        ///
+        /// THE ONE IDENTITY FACT THE SDK CANNOT ESTABLISH ITSELF, which is
+        /// why it is settable at all. `appIdentifier` is read natively
+        /// precisely so a JS value cannot claim to be a different application.
+        /// There is no native source for a user id: only the host app's own
+        /// auth system knows who is signed in, so this value MUST come from the
+        /// host and the native-only rule above does not reach it. (The browser
+        /// SDK treats `userId` as a first-class caller-supplied envelope field
+        /// for exactly the same reason.)
+        ///
+        /// VALIDATED BY `IdentityPolicy`, NEVER BY A CALL SITE. It refuses
+        /// rather than truncating — a shortened opaque key is a DIFFERENT user
+        /// and accepts verbatim, because the browser producer writes this
+        /// same column with no trim and one customer key must not be stored
+        /// two ways.
+        public let userId: String?
 
         public init(projectId: String, sessionId: String, anonymousId: String,
                     environment: String, appIdentifier: String,
-                    initialScreen: String? = nil) {
+                    initialScreen: String? = nil,
+                    userId: String? = nil) {
             self.projectId = projectId
             self.sessionId = sessionId
             self.anonymousId = anonymousId
             self.environment = environment
             self.appIdentifier = appIdentifier
             self.initialScreen = initialScreen
+            self.userId = userId
         }
     }
 
@@ -109,6 +130,16 @@ public enum RnEnvelope {
         /// fixtures put the OS version there, so a top-level one would be a
         /// second representation of a fact that already has a home.
         indirect case object([(String, Value)])
+        /// A JSON array, rendered through the same `value` as everything
+        /// else so a member cannot escape the quoting rules the top level
+        /// obeys.
+        ///
+        /// ADDED FOR `frames[]`, AND TYPED RATHER THAN `rawJson`.
+        /// `rawJson` is documented as INTERNAL ONLY with one producer (the
+        /// hierarchy serializer, whose bytes come from `CanonicalHierarchy`);
+        /// routing a second, caller-shaped structure through it would make that
+        /// sentence false and put string assembly back in a caller's hands.
+        indirect case array([Value])
     }
 
     /// MODEL B — the native↔WebView correlation carrier. The SWIFT TWIN of
@@ -191,6 +222,26 @@ public enum RnEnvelope {
         fields.append(("sessionId", .string(id.sessionId)))
         fields.append(("anonymousId", .string(id.anonymousId)))
         fields.append(("environment", .string(id.environment)))
+        // EVERY EVENT, NOT THE OPENER — the one identity fact that breaks
+        // the opener-only rule below, and deliberately.
+        //
+        // That rule holds for values that cannot change within the session.
+        // `userId` is the single identity fact that CAN: `identify` is a
+        // mid-session call, so an anonymous session that signs in minutes after
+        // its opener must still be attributable. The deployed server says the
+        // same thing from its own side — it learns the identity "across the
+        // WHOLE chunk rather than from its first envelope", because "the
+        // envelope that carries a userId is routinely NOT the one that opened
+        // the chunk" — and resolves conflicts by HIGHEST SEQUENCE.
+        //
+        // Stamping every event is therefore also SELF-HEALING: the winner is
+        // the highest sequence the server ever sees, so one lost or quarantined
+        // chunk cannot strand a session as anonymous forever.
+        //
+        // An anonymous session appends nothing, so it pays no bytes for this.
+        if let userId = id.userId {
+            fields.append(("userId", .string(userId)))
+        }
         if eventType == "mobile_session_start" {
             // Only the opener names the app — the server reads identity from
             // the `mobile_session_start` event alone.
@@ -470,6 +521,163 @@ public enum RnEnvelope {
     }
 
     // ------------------------------------------------------------- emission
+    /// One `frames[]` entry of a `mobile_crash` / `mobile_hang` event.
+    ///
+    /// NO `address`, AND NO `message` ANYWHERE ON THE EVENT. The schema
+    /// declares both `frames[].address` and a top-level `message`; this
+    /// producer emits neither. A raw address is only useful with the exact
+    /// binary it came from and is a pointer into the process the privacy model
+    /// says nothing about; the message exclusion is inherited from the Android
+    /// native producer's own stated rule — "application code interpolates
+    /// values into messages, and a crash report is not an exemption from the
+    /// privacy model". `symbol` is the developer's own identifier, which is why
+    /// it is the one string the contract bounds rather than forbids.
+    public struct IncidentFrame {
+        public let index: Int
+        public let module: String?
+        public let symbol: String?
+        /// The symbolication artifact this stack resolves against, on frame 0
+        /// ONLY — the DEPLOYED planner reads `frames[0].artifactKind` and
+        /// `frames[0].artifactIdentifier` and nothing else.
+        ///
+        /// A VALUE OUTSIDE THE SERVER'S VOCABULARY IS A PERMANENT 422 ON THE
+        /// WHOLE CHUNK (`incident_artifact_kind_invalid`), taking whatever was
+        /// batched with it. Absence is legal — symbolication is optional.
+        public let artifactKind: String?
+        public let artifactIdentifier: String?
+
+        public init(index: Int, module: String? = nil, symbol: String? = nil,
+                    artifactKind: String? = nil, artifactIdentifier: String? = nil) {
+            self.index = index
+            self.module = module
+            self.symbol = symbol
+            self.artifactKind = artifactKind
+            self.artifactIdentifier = artifactIdentifier
+        }
+
+        /// Declared keys only, in schema order.
+        ///
+        /// AN ABSENT KEY IS OMITTED, NEVER EMITTED AS NULL — and on this
+        /// platform that has to be done HERE. The Swift `json` renders every
+        /// pair it is given (the Kotlin twin's `json` skips nulls for the
+        /// whole map), so a Swift builder that appended an optional
+        /// unconditionally would ship `"module":null` where Kotlin ships
+        /// nothing — a byte divergence between twins on the same contract.
+        var fields: [(String, Value)] {
+            var f: [(String, Value)] = [("index", .int(index))]
+            if let m = module { f.append(("module", .string(m))) }
+            if let s = symbol { f.append(("symbol", .string(s))) }
+            if let k = artifactKind { f.append(("artifactKind", .string(k))) }
+            if let i = artifactIdentifier { f.append(("artifactIdentifier", .string(i))) }
+            return f
+        }
+    }
+
+    /// The `mobile_crash` event. Byte-parallel to the Kotlin `RnEnvelope.crash`.
+    ///
+    /// THE FIELD NAMES ARE THE CONTRACT'S, NOT THE ANDROID NATIVE PRODUCER'S,
+    /// AND THE DIFFERENCE IS MEASURED. Native emits `exceptionType` and
+    /// `stackFrames` and no `crashClass`, while the deployed planner reads
+    /// `crashClass` and `frames` — so all 13 production crash rows carry
+    /// `incident_class = NULL` and `frame_count = 0`, every crash marker in the
+    /// Viewer renders "Crash: unknown class", and `frames[0].artifactKind` can
+    /// never be read so the stack has no artifact to symbolicate against.
+    ///
+    /// `deliveredOnNextLaunch` IS ALWAYS TRUE FOR A FATAL CRASH — a statement
+    /// about this record's ONLY possible delivery path, not a guess. The
+    /// protocol declares the field precisely so a reader does not mistake that
+    /// gap for clock skew.
+    public static func crash(id: Identity,
+                             eventId: String,
+                             sequence: Int64,
+                             timestampMillis: Int64,
+                             monotonicNanos: Int64,
+                             posture: Posture,
+                             /// REQUIRED and bounded. The DEPLOYED planner
+                             /// refuses absent or over-long with
+                             /// `incident_identity_missing` / `_invalid`, a
+                             /// PERMANENT 422 on the whole chunk.
+                             errorId: String,
+                             /// A member of `IncidentPolicy.crashClasses` —
+                             /// classified by the policy, never here.
+                             crashClass: String,
+                             exceptionType: String?,
+                             threadName: String?,
+                             isMainThread: Bool?,
+                             frames: [IncidentFrame],
+                             screenId: String?,
+                             fatal: Bool = true) -> String {
+        var extra: [(String, Value)] = [
+            ("errorId", .string(errorId)),
+            ("crashClass", .string(crashClass)),
+            ("fatal", .bool(fatal)),
+        ]
+        // The schema's name for the exception class is `type`, bounded to the
+        // length the schema declares.
+        if let t = IncidentPolicy.boundType(exceptionType) { extra.append(("type", .string(t))) }
+        if let n = IncidentPolicy.boundThreadName(threadName) { extra.append(("threadName", .string(n))) }
+        if let m = isMainThread { extra.append(("isMainThread", .bool(m))) }
+        extra.append(("deliveredOnNextLaunch", .bool(true)))
+        if !frames.isEmpty {
+            extra.append(("frames", .array(frames.map { .object($0.fields) })))
+        }
+        if let s = IncidentPolicy.boundScreenId(screenId) { extra.append(("screen", .screen(ScreenRef(screenId: s)))) }
+        // THE FRAME CAP IS NOT DISCLOSED ON THE WIRE, AND THAT IS THE
+        // CONTRACT'S DOING. The envelope's `dropped` map is a PER-FAMILY LOSS
+        // counter whose own description says "intentional privacy suppression is
+        // NOT loss and must never appear here"; a within-event frame truncation
+        // is neither, and there is no declared field for it. Inventing one is
+        // exactly what native did with `exceptionType` / `stackFrames`. The drop
+        // is disclosed LOCALLY through `RecoveryTrace`.
+        return envelope(id: id, eventId: eventId, eventType: "mobile_crash",
+                        sequence: sequence, timestampMillis: timestampMillis,
+                        monotonicNanos: monotonicNanos, posture: posture, extra: extra)
+    }
+
+    /// The `mobile_hang` event. Byte-parallel to the Kotlin `RnEnvelope.hang`.
+    ///
+    /// `blockedMs` IS AN `Int`, NOT A `Double`, AND THAT IS DELIBERATE. The
+    /// `.double` case renders a non-finite value as `null`, and the server reads
+    /// `blockedMs` with no range — so a NaN computed across a clock step would
+    /// reach a `double precision` column as a null nobody chose. An `Int` cannot
+    /// be non-finite, and `IncidentPolicy.hangIsEmittable` refuses the value
+    /// upstream anyway, so the two guards are independent rather than the same
+    /// guard twice.
+    public static func hang(id: Identity,
+                            eventId: String,
+                            sequence: Int64,
+                            timestampMillis: Int64,
+                            monotonicNanos: Int64,
+                            posture: Posture,
+                            errorId: String,
+                            /// A member of `IncidentPolicy.hangKinds`.
+                            hangKind: String,
+                            blockedMs: Int,
+                            thresholdMs: Int?,
+                            recovered: Bool,
+                            frames: [IncidentFrame],
+                            screenId: String?,
+                            deliveredOnNextLaunch: Bool = false) -> String {
+        var extra: [(String, Value)] = [
+            ("errorId", .string(errorId)),
+            ("hangKind", .string(hangKind)),
+            ("blockedMs", .int(blockedMs)),
+        ]
+        if let t = thresholdMs { extra.append(("threshold", .int(t))) }
+        extra.append(("recovered", .bool(recovered)))
+        extra.append(("deliveredOnNextLaunch", .bool(deliveredOnNextLaunch)))
+        if !frames.isEmpty {
+            extra.append(("frames", .array(frames.map { .object($0.fields) })))
+        }
+        // `mobile_hang` declares its OWN `screenId` string (not a screen
+        // object), and the deployed planner reads `e.screenId` BEFORE
+        // `e.screen.screenId` — so the declared shape is what goes on the wire.
+        if let s = IncidentPolicy.boundScreenId(screenId) { extra.append(("screenId", .string(s))) }
+        return envelope(id: id, eventId: eventId, eventType: "mobile_hang",
+                        sequence: sequence, timestampMillis: timestampMillis,
+                        monotonicNanos: monotonicNanos, posture: posture, extra: extra)
+    }
+
     static func json(_ pairs: [(String, Value)]) -> String {
         var out = "{"
         var first = true
@@ -511,6 +719,8 @@ public enum RnEnvelope {
             // else, so a nested member cannot escape the quoting rules the top
             // level obeys.
             return "{" + members.map { k, v in str(k) + ":" + value(k, v) }.joined(separator: ",") + "}"
+        case .array(let items):
+            return "[" + items.map { value(key, $0) }.joined(separator: ",") + "]"
         case .posture(let p):
             return json([
                 ("level", .string(p.level)),

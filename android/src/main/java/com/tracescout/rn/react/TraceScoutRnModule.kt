@@ -121,7 +121,7 @@ class TraceScoutRnModule(
         },
         // Hierarchy capture is native wiring only: the presence of this closure
         // is the enablement, and no `@ReactMethod` can reach or replace it, so
-        // the JavaScript surface stays at exactly eleven methods. The walker
+        // it adds nothing to the JavaScript surface at all. The walker
         // refuses in background, FLAG_SECURE and no-activity states, and the
         // bridge then records an honest metadata-only snapshot, carrying a
         // reason only when one of the two protocol conditions was observed.
@@ -241,8 +241,13 @@ class TraceScoutRnModule(
 
     // ---------------------------------------------------------- JS surface
     //
-    // Exactly eleven methods, identical to the exported iOS surface. A method
+    // This list mirrors the exported iOS surface, method for method. A method
     // that is not here does not exist for JavaScript.
+    //
+    // The agreement is stated as a RULE and not as a count on purpose. A count
+    // has no name to add: when a reviewed method joined the iOS surface, every
+    // place that named the methods gained it in a legible diff, and the one
+    // place that carried only a number went stale with nothing to point at.
 
     @ReactMethod fun startSession(initialRouteId: String?, promise: Promise) =
         promise.resolve(bridge.startSession(initialRouteId).outcome.name)
@@ -290,6 +295,13 @@ class TraceScoutRnModule(
 
     @ReactMethod fun hostDetached(routeId: String, hostId: String, promise: Promise) =
         promise.resolve(bridge.hostDetached(routeId, hostId).name)
+
+    // Validation, the session guard and the refusal of a blank argument all
+    // live in the bridge, beside the identity supplier they depend on. A rule
+    // implemented here would be reachable only from JavaScript, in the one
+    // module that cannot be exercised without a device.
+    @ReactMethod fun identify(userId: String?, promise: Promise) =
+        promise.resolve(bridge.identify(userId).name)
 
     @ReactMethod fun state(promise: Promise) = promise.resolve(bridge.state())
 
