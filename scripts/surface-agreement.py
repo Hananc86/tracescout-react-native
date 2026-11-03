@@ -137,6 +137,42 @@ absent = sorted(set(ts) - in_default)
 check('D2', not absent,
       f'every declared method is on the default export too; absent: {absent or "none"}')
 
+# --- an exported method must have its ENABLEMENT wired --------------------
+# Agreeing on names is not the same as being able to succeed. The bridge takes
+# optional dependencies that default to null, and a method whose dependency was
+# not supplied answers NOT_INTEGRATED on every call: it compiles, it carries
+# its platform's export annotation, it agrees with every declaration above --
+# and it cannot work. That exact defect shipped once already, which is why the
+# iOS module's comment beside `applyUserId` reads "ITS ABSENCE WAS THE WHOLE
+# DEFECT".
+#
+# So: derive from each bridge the dependencies whose absence yields
+# NOT_INTEGRATED, and require the platform's module to supply every one.
+KT_BRIDGE = 'android/src/main/java/com/tracescout/rn/bridge/RnBridge.kt'
+SWIFT_BRIDGE = 'ios/TraceScoutRN/RnBridge.swift'
+SWIFT_MODULE = 'ios/RNBridge/TraceScoutRnModule.swift'
+
+needed_kt = sorted(set(re.findall(
+    r'(\w+)\s*\?:\s*return\s+Outcome\.NOT_INTEGRATED', read(KT_BRIDGE))))
+needed_swift = sorted(set(re.findall(
+    r'guard\s+let\s+\w+\s*=\s*(\w+)\s+else\s*\{\s*return\s+\.notIntegrated',
+    read(SWIFT_BRIDGE))))
+
+check('F0', bool(needed_kt) and bool(needed_swift),
+      f'the enablement derivation is non-vacuous: kotlin {needed_kt}, swift {needed_swift}')
+
+# Kotlin supplies a named argument `x = ...`; Swift supplies `x: ...`.
+missing_kt = [d for d in needed_kt
+              if not re.search(r'\b' + re.escape(d) + r'\s*=', src_kt)]
+missing_swift = [d for d in needed_swift
+                 if not re.search(r'\b' + re.escape(d) + r'\s*:', read(SWIFT_MODULE))]
+check('F1', not missing_kt,
+      f'the Android module supplies every dependency whose absence is '
+      f'NOT_INTEGRATED; missing: {missing_kt or "none"}')
+check('F2', not missing_swift,
+      f'the iOS module supplies every dependency whose absence is '
+      f'NOT_INTEGRATED; missing: {missing_swift or "none"}')
+
 # --- the README's API table is the fifth declaration ----------------------
 # It is what a customer reads to learn the surface, so a method shipped but
 # undocumented is a method they cannot know about. Containment, not equality:

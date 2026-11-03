@@ -111,6 +111,37 @@ class TraceScoutRnModule(
         // composes only attempt id, route, generation, timings and typed
         // reasons; no credential and no captured content is in scope there.
         trace = { line -> android.util.Log.i("TraceScoutRouteHost", line) },
+        // The owner's store for the identified user.
+        //
+        // ITS ABSENCE IS THE WHOLE DEFECT, and the iOS module says so in the
+        // same words: `RnBridge.identify` has existed for a while and
+        // `applyUserId` defaults to null, so without this closure the call can
+        // only ever answer NOT_INTEGRATED -- documented, unit-tested, and
+        // structurally unreachable from a running app. Exporting the method to
+        // JavaScript without supplying this would have shipped a method that
+        // compiles, is annotated, agrees with every other declaration of the
+        // surface, and cannot succeed.
+        //
+        // PRESENCE OF THIS CLOSURE IS THE ENABLEMENT, exactly like `hierarchy`.
+        // A host that does not supply it gets NOT_INTEGRATED rather than a
+        // silent no-op, so "this app never names users" and "the SDK dropped
+        // the name" stay different answers.
+        applyUserId = { userId ->
+            // Under the lock and re-read: `startSession` can replace the
+            // session between the bridge's own guard and this write, and
+            // applying the name to the session read earlier would resurrect a
+            // session that no longer exists. A false return is the bridge's
+            // `.noSession`, which is the honest answer for that race.
+            synchronized(identityLock) {
+                val current = session
+                if (current == null) {
+                    false
+                } else {
+                    session = current.copy(userId = userId)
+                    true
+                }
+            }
+        },
         clock = object : RnBridge.NativeClock {
             override fun wallMillis() = System.currentTimeMillis()
             override fun monotonicNanos() = System.nanoTime()
@@ -210,7 +241,13 @@ class TraceScoutRnModule(
         } },
     )
 
+    // Read by the bridge's `identity` supplier, written by `beginIdentity` and
+    // by `applyUserId`, from different threads. Volatile for visibility, and
+    // every WRITE takes `identityLock` because both writers read-modify-write.
+    @Volatile
     private var session: RnEnvelope.Identity? = null
+
+    private val identityLock = Any()
 
     /**
  * The one creator of a session on this platform, called exclusively by the
@@ -236,7 +273,7 @@ class TraceScoutRnModule(
             appVersion = packageVersionName(ctx),
             buildNumber = packageVersionCode(ctx),
             device = deviceFacts(ctx),
-        ).also { session = it }
+        ).also { minted -> synchronized(identityLock) { session = minted } }
     }
 
     // ---------------------------------------------------------- JS surface
