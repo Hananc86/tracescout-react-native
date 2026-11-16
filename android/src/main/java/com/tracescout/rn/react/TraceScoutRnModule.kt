@@ -111,6 +111,37 @@ class TraceScoutRnModule(
         // composes only attempt id, route, generation, timings and typed
         // reasons; no credential and no captured content is in scope there.
         trace = { line -> android.util.Log.i("TraceScoutRouteHost", line) },
+        // The owner's store for the identified user.
+        //
+        // ITS ABSENCE IS THE WHOLE DEFECT, and the iOS module says so in the
+        // same words: `RnBridge.identify` has existed for a while and
+        // `applyUserId` defaults to null, so without this closure the call can
+        // only ever answer NOT_INTEGRATED -- documented, unit-tested, and
+        // structurally unreachable from a running app. Exporting the method to
+        // JavaScript without supplying this would have shipped a method that
+        // compiles, is annotated, agrees with every other declaration of the
+        // surface, and cannot succeed.
+        //
+        // PRESENCE OF THIS CLOSURE IS THE ENABLEMENT, exactly like `hierarchy`.
+        // A host that does not supply it gets NOT_INTEGRATED rather than a
+        // silent no-op, so "this app never names users" and "the SDK dropped
+        // the name" stay different answers.
+        applyUserId = { userId ->
+            // Under the lock and re-read: `startSession` can replace the
+            // session between the bridge's own guard and this write, and
+            // applying the name to the session read earlier would resurrect a
+            // session that no longer exists. A false return is the bridge's
+            // `.noSession`, which is the honest answer for that race.
+            synchronized(identityLock) {
+                val current = session
+                if (current == null) {
+                    false
+                } else {
+                    session = current.copy(userId = userId)
+                    true
+                }
+            }
+        },
         clock = object : RnBridge.NativeClock {
             override fun wallMillis() = System.currentTimeMillis()
             override fun monotonicNanos() = System.nanoTime()
@@ -121,7 +152,7 @@ class TraceScoutRnModule(
         },
         // Hierarchy capture is native wiring only: the presence of this closure
         // is the enablement, and no `@ReactMethod` can reach or replace it, so
-        // the JavaScript surface stays at exactly eleven methods. The walker
+        // it adds nothing to the JavaScript surface at all. The walker
         // refuses in background, FLAG_SECURE and no-activity states, and the
         // bridge then records an honest metadata-only snapshot, carrying a
         // reason only when one of the two protocol conditions was observed.
@@ -210,7 +241,13 @@ class TraceScoutRnModule(
         } },
     )
 
+    // Read by the bridge's `identity` supplier, written by `beginIdentity` and
+    // by `applyUserId`, from different threads. Volatile for visibility, and
+    // every WRITE takes `identityLock` because both writers read-modify-write.
+    @Volatile
     private var session: RnEnvelope.Identity? = null
+
+    private val identityLock = Any()
 
     /**
  * The one creator of a session on this platform, called exclusively by the
@@ -236,13 +273,18 @@ class TraceScoutRnModule(
             appVersion = packageVersionName(ctx),
             buildNumber = packageVersionCode(ctx),
             device = deviceFacts(ctx),
-        ).also { session = it }
+        ).also { minted -> synchronized(identityLock) { session = minted } }
     }
 
     // ---------------------------------------------------------- JS surface
     //
-    // Exactly eleven methods, identical to the exported iOS surface. A method
+    // This list mirrors the exported iOS surface, method for method. A method
     // that is not here does not exist for JavaScript.
+    //
+    // The agreement is stated as a RULE and not as a count on purpose. A count
+    // has no name to add: when a reviewed method joined the iOS surface, every
+    // place that named the methods gained it in a legible diff, and the one
+    // place that carried only a number went stale with nothing to point at.
 
     @ReactMethod fun startSession(initialRouteId: String?, promise: Promise) =
         promise.resolve(bridge.startSession(initialRouteId).outcome.name)
@@ -290,6 +332,13 @@ class TraceScoutRnModule(
 
     @ReactMethod fun hostDetached(routeId: String, hostId: String, promise: Promise) =
         promise.resolve(bridge.hostDetached(routeId, hostId).name)
+
+    // Validation, the session guard and the refusal of a blank argument all
+    // live in the bridge, beside the identity supplier they depend on. A rule
+    // implemented here would be reachable only from JavaScript, in the one
+    // module that cannot be exercised without a device.
+    @ReactMethod fun identify(userId: String?, promise: Promise) =
+        promise.resolve(bridge.identify(userId).name)
 
     @ReactMethod fun state(promise: Promise) = promise.resolve(bridge.state())
 

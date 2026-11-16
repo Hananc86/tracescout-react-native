@@ -261,6 +261,90 @@ public interface AttributionSink {
  */
     public fun f7InheritedSessions(exclude: String): List<String> = emptyList()
 
+    /**
+ * **F-15 — the DURABLE pending claim's state for [sessionId]: a boundary, a
+ * proven absence, or an admission that the authority could not be read.** A
+ * READ, and nothing else: it opens no authority that does not exist, writes
+ * nothing, and creates nothing.
+ *
+ * IT EXISTS BECAUSE THE PIPELINE CANNOT ASK THE QUESTION ANY OTHER WAY.
+ * `DurableUploadPipeline` holds an `AttributionSink`, never a
+ * `LossAuthority.Handle`, so "does this session hold a stranded claim whose
+ * boundary is BELOW the batch I am about to deliver?" has no other door. The
+ * boundary is the only VALUE carried — not the counts, not the identity —
+ * because the decision needs the boundary and the RE-SEND re-derives every
+ * other field from the row itself.
+ *
+ * **IT RETURNED A BARE `Long` AND `-1` MEANT TWO DIFFERENT THINGS. THAT
+ * WAS THE DEFECT, AND IT WAS A SAFETY DEFECT RATHER THAN A TIDINESS ONE.**
+ * Both "the authority was read and holds no claim" and "the authority could
+ * not be read" answered `-1`, and the predecessor's own KDoc justified the
+ * conflation with *"in every one of them the only safe action is none"*. That
+ * was true while the answer only chose whether to ATTEMPT A CARRIER. It
+ * stopped being true the moment the answer also GATES DELIVERY: for an
+ * unreadable authority "do nothing" means *deliver the chunk anyway*, and if
+ * a stranded claim is in fact outstanding, F6 re-attaches it by value and the
+ * deployed ingest refuses the WHOLE chunk permanently
+ * (`loss_checkpoint_through_not_chunk_aligned`, `retriable:false`). An
+ * unreadable authority is therefore UNKNOWN, never ABSENT — fail-closed now
+ * means *refuse to deliver*, which is the opposite of the old sentinel's
+ * meaning, so the sentinel had to go rather than be re-documented.
+ *
+ * DEFAULT [PendingClaim.None] on the interface, like every other F6/F7
+ * member here: a sink that has not been taught about F-15 — and the
+ * implementers include test doubles that model the F2 seam — reports no claim
+ * and therefore gates nothing, which is exactly today's behaviour.
+ */
+    public fun f7PendingClaim(sessionId: String): PendingClaim = PendingClaim.None
+
+    /**
+ * **F-15 — the three ANSWERS a durable loss authority can give about a
+ * pending claim, kept apart because two of them demand opposite actions.**
+ *
+ * There is deliberately no `Long` in this vocabulary other than inside
+ * [Pending]: a caller cannot accidentally compare an absence with a boundary,
+ * because an absence has no number to compare.
+ */
+    public sealed class PendingClaim {
+        /** The authority WAS read and holds no outstanding claim. Nothing to settle. */
+        public object None : PendingClaim()
+
+        /** A claim is durable with this frozen boundary. `>= 0` by construction. */
+        public class Pending(public val throughSequence: Long) : PendingClaim()
+
+        /**
+ * The authority could not be read. **NOT [None]** — this says nothing
+ * about whether a claim exists, so a caller that needs to know whether a
+ * delivery is safe must treat it as unsafe.
+ */
+        public class Unreadable(public val detail: String) : PendingClaim()
+    }
+
+    /**
+ * **F-15 — RE-SEND the EXISTING frozen claim on the `events: []` carrier, or
+ * null. It can never mint a fresh one.**
+ *
+ * **THE DIFFERENCE FROM [f7MetadataOnlyCheckpoint] IS THE WHOLE POINT,
+ * and it is STRUCTURAL rather than a convention.** That member PERSISTS a
+ * claim before it returns bytes — which is why R-2 must read terminality
+ * first — so a caller that wanted only the re-send and used it would write an
+ * `advance` claim whenever the pending row had settled in between. This one
+ * calls the same emitter with `pendingOnly = true`, under which
+ * `MetadataOnlyCarrier` and `requestCheckpoint` are unreachable: the only two
+ * outcomes are the by-value re-send of an already-durable claim, and nothing.
+ *
+ * IT IS NOT GATED ON TERMINALITY, deliberately. The claim being re-sent is
+ * already durable, so the act was authorised when it was frozen; the document
+ * carries `terminal` FROM THE ROW, so a non-terminal claim re-sends as
+ * non-terminal and this member cannot disclose an end that was not declared.
+ * Asking `f7SessionFinalized` here would refuse exactly the F-15 case — a
+ * live session whose crash-recovery batch is blocked by its own stranded
+ * claim.
+ *
+ * DEFAULT NULL, for the same fail-closed reason as every member above.
+ */
+    public fun f7PendingCheckpointRetry(sessionId: String): MetadataOnlyDocument? = null
+
     /** The F7 document plus the claim identity the request is addressed with. */
     public class MetadataOnlyDocument internal constructor(
         public val json: String,
@@ -327,6 +411,8 @@ public interface AttributionSink {
             override fun f6CheckpointJson(sessionId: String, firstSequence: Long, lastSequence: Long, reservedBytes: Int, resuming: Boolean): String? = null
             override fun f7MetadataOnlyCheckpoint(sessionId: String): MetadataOnlyDocument? = null
             override fun f7SessionFinalized(sessionId: String): Boolean = false
+            override fun f7PendingClaim(sessionId: String): PendingClaim = PendingClaim.None
+            override fun f7PendingCheckpointRetry(sessionId: String): MetadataOnlyDocument? = null
         }
 
         /**
@@ -568,6 +654,100 @@ public interface AttributionSink {
  */
                 override fun f7InheritedSessions(exclude: String): List<String> =
                     LossAuthority.sessionIdsOnDisk(filesDir, exclude)
+
+                /**
+ * F-15 — the SAME `f6Handle` door a FOURTH time, deliberately.
+ * The reconciliation's precondition and its document must agree
+ * about whether this session HAS a durable authority, and a
+ * second resolver would be a second opinion on that.
+ *
+ * **UNREADABLE AND ABSENT USED TO COLLAPSE TO `-1` HERE, AND
+ * THE PREDECESSOR'S OWN COMMENT SAID THEY "ARE NOT THE SAME
+ * FACT" WHILE RETURNING THE SAME VALUE FOR BOTH.** Tracing the
+ * difference and then discarding it is not keeping it: the
+ * caller got one number and could not tell a proven absence from
+ * an admission of ignorance. The three cases are now three
+ * values, and the only one carrying a boundary is the one that
+ * HAS one:
+ *
+ * - no authority DIRECTORY for this session → [PendingClaim.None].
+ * A session with no authority can hold no claim, and this is
+ * the no-authority compatibility path (pre-F2 records).
+ * - the directory EXISTS and the handle could not be opened →
+ * [PendingClaim.Unreadable]. `f6Handle` answers null for both,
+ * which is why the directory is asked about separately.
+ * - the authority was read and holds no claim → [PendingClaim.None].
+ * - the read THREW → [PendingClaim.Unreadable]. Says nothing
+ * about whether a claim exists, so a caller deciding whether a
+ * delivery is safe must treat it as unsafe.
+ *
+ * A reconciliation attempt built on an authority we could not
+ * read would still be a request made on a boundary we invented,
+ * so `Unreadable` does not attempt one either — but it no longer
+ * lets the DATA chunk through.
+ */
+                override fun f7PendingClaim(sessionId: String): PendingClaim = try {
+                    val h = f6Handle(sessionId)
+                    if (h == null) {
+                        // **`f6Handle` RETURNING NULL HAS TWO MEANINGS AND
+                        // ONLY ONE OF THEM IS AN ABSENCE** — it is
+                        // `peek ?: if (authorityExists) handle else null`,
+                        // so null is EITHER "this session has no authority at
+                        // all" OR "it has one and it could not be opened". The
+                        // first version of this method called both `None`,
+                        // which is the same conflation one layer down from the
+                        // `-1` sentinel this change exists to remove — and a
+                        // control-driven row found it by corrupting the
+                        // authority's own bytes, where the delivery went
+                        // straight through. The directory's existence is the
+                        // fact that separates them.
+                        if (LossAuthority.authorityExists(filesDir, sessionId))
+                            PendingClaim.Unreadable("authority_present_not_openable")
+                        else PendingClaim.None
+                    } else if (h.disabled() != null) {
+                        // **A DISABLED SESSION'S PENDING CLAIM CAN STRAND
+                        // NOTHING, SO REPORTING IT AS `Pending` BLOCKED THE
+                        // SESSION FOR EVER.** `F6CheckpointEmitter.decide`
+                        // omits for a disabled session BEFORE it reads the
+                        // pending row, so no stale checkpoint can ride that
+                        // session's data chunk and the alignment refusal the
+                        // gate exists to prevent is unreachable for it.
+                        // Meanwhile `F7MetadataOnlyEmitter.decide` ALSO omits
+                        // for a disabled session — before its `pendingOnly`
+                        // branch — so the carrier can never settle the claim
+                        // either, and the reconciliation's `emitter_omitted`
+                        // return precedes the burst counter, which means not
+                        // even the bounded budget could end the loop. The
+                        // records stayed queued for as long as the pending row
+                        // and the disabled state both persisted.
+                        //
+                        // `None` is the honest answer rather than a workaround:
+                        // the question this method answers is "can a stranded
+                        // claim ride this session's next chunk?", and for a
+                        // disabled session the emitter has already decided that
+                        // nothing will.
+                        PendingClaim.None
+                    } else {
+                        val through = h.pendingCheckpoint()?.throughSequence
+                        if (through == null) PendingClaim.None else PendingClaim.Pending(through)
+                    }
+                } catch (t: Throwable) {
+                    RecoveryTrace.log("f15_pending_claim_unreadable",
+                        "detail" to t.javaClass.simpleName, "session" to sessionId.take(24))
+                    PendingClaim.Unreadable(t.javaClass.simpleName)
+                }
+
+                /**
+ * F-15 — the by-value re-send, through the SAME emitter under
+ * `pendingOnly = true`. Nothing here decides anything: the
+ * emitter owns the refusals and core owns the document.
+ */
+                override fun f7PendingCheckpointRetry(sessionId: String): MetadataOnlyDocument? = when (
+                    val d = F7MetadataOnlyEmitter.decide(f6Handle(sessionId), pendingOnly = true)
+                ) {
+                    is F7MetadataOnlyEmitter.Decision.Emit -> MetadataOnlyDocument(d.json, d.chunkId, d.retry)
+                    is F7MetadataOnlyEmitter.Decision.Omit -> null
+                }
             }
     }
 }

@@ -76,6 +76,23 @@ public final class RnBridge {
     /// Publishes a candidate as active. Returns false if the generation moved
     /// (a reset happened between the opener append and this call).
     private let publish: (RnEnvelope.Identity, UInt64) -> Bool
+    /// APPLY an already-VALIDATED identified user to the live session (G2).
+    ///
+    /// THE OWNER STORES; THIS CLASS ONLY DECIDES. `identity` is a supplier,
+    /// so the session identity is held by whoever constructed this bridge, and
+    /// the setter has to reach the same place. A second copy of the identity
+    /// here would be the "one fact, two homes" failure the producer has already
+    /// paid for once on the node wire.
+    ///
+    /// IT RECEIVES ONLY AN ACCEPTED VALUE. `identify` runs `IdentityPolicy`
+    /// FIRST and never calls this with a blank, over-long or absent candidate,
+    /// so an owner cannot accidentally store something the server would
+    /// discard. Returns false when the owner could not apply it, which surfaces
+    /// as `.refused` rather than a silent success.
+    ///
+    /// Nil = `identify` is NOT INTEGRATED in this application, and says so
+    /// (`.notIntegrated`) instead of quietly doing nothing.
+    private let applyUserId: ((String) -> Bool)?
     private let configured: () -> Bool
     private let sink: DurableSink
     private let clock: NativeClock
@@ -284,8 +301,14 @@ public final class RnBridge {
                   webViewRef: (() -> RnEnvelope.WebViewRef?)? = nil,
                   /// Durable route-host transition trace: attempt id, route, timings,
                   /// typed reasons — never a credential, never captured content.
-                  trace: ((String) -> Void)? = nil) {
+                  trace: ((String) -> Void)? = nil,
+                  /// G2 identify. LAST and DEFAULTED, like every other
+                  /// provider: a caller that has not been taught about it must
+                  /// get the pre-existing answer — `.notIntegrated` — never a
+                  /// silent no-op.
+                  applyUserId: ((String) -> Bool)? = nil) {
         self.identity = identity; self.mintCandidate = mintCandidate
+        self.applyUserId = applyUserId
         self.publish = publish
         self.configured = configured; self.sink = sink
         self.clock = clock; self.ids = ids
@@ -406,6 +429,64 @@ public final class RnBridge {
         lock.lock(); defer { lock.unlock() }
         if never { neverRecordRoutes.insert(routeId) } else { neverRecordRoutes.remove(routeId) }
         return .recorded
+    }
+
+    /// Name the IDENTIFIED USER for the live session (G2) — the producer half of
+    /// `identify`.
+    ///
+    /// The envelope has declared a root `userId` all along and the deployed
+    /// server learned to store it (api-web `3f40126f`, migration 181); no
+    /// producer emitted one, so `sessions.user_id` was NULL for every mobile
+    /// session and the dashboard's user search and Signed-up filter were dark
+    /// for the whole family. This is the call that ends that.
+    ///
+    /// IT EMITS NO EVENT, and that is deliberate. The identity rides the
+    /// envelope of events the session was going to send anyway, so naming a
+    /// user costs no queue entry, no chunk and no drain. Minting a record here
+    /// would also make the identity depend on that one record surviving, where
+    /// stamping leaves the server free to take the highest sequence it sees.
+    ///
+    /// IT TAKES NO SESSION ARGUMENT. The identity applies to the session the
+    /// `identity` supplier reports, exactly like `endSessionAuthoritatively` —
+    /// so a JS caller cannot name a user on a session it is not running.
+    ///
+    /// A BLANK ARGUMENT IS REFUSED, NOT A SIGN-OUT. The server's merge is
+    /// incoming-wins-if-higher-sequence over a non-null identity, so an
+    /// envelope naming no user does not clear a stored one: sign-out is not
+    /// expressible through this field at all. Clearing locally would make the
+    /// device stop stamping while the server kept the old value, and the two
+    /// would disagree with nothing saying so. `.invalidInput` is honest.
+    ///
+    /// Idempotent in effect; never throws into the host app.
+    public func identify(userId: String?) -> Outcome {
+        guard configured() else { return .notConfigured }
+        // `identity`, NEVER `mintCandidate` — for the same reason
+        // `endSessionAuthoritatively` uses it: a session minted because its own
+        // identify was the first caller would have no `mobile_session_start`,
+        // which the server refuses to originate.
+        guard identity() != nil else { return .noSession }
+        guard let apply = applyUserId else { return .notIntegrated }
+        // ONE validation home. The decision carries a length and a verdict and
+        // deliberately NOT the value, so the trace below cannot leak an end
+        // user's key.
+        let decision = IdentityPolicy.classifyUserId(userId)
+        guard let accepted = decision.value else {
+            trace?("identify refused verdict=\(decision.verdict.rawValue) "
+                   + "len=\(decision.length ?? -1) max=\(IdentityPolicy.userIdMax)")
+            return .invalidInput
+        }
+        let applied = apply(accepted)
+        trace?("identify applied=\(applied) len=\(decision.length ?? -1)")
+        // `.noSession`, NOT `.suppressed`. The owner can only fail to apply
+        // an already-ACCEPTED value because the session went away between the
+        // guard above and this line — a race, and the same fact `.noSession`
+        // already names. `.suppressed` is documented as "the policy or the
+        // app's consent declined to store it", which is a different claim and
+        // would blame a privacy decision for a lost race. There is no
+        // `.refused` on this enum (the Kotlin twin has one; this one does not),
+        // and inventing a case to match would change a shared vocabulary for a
+        // single call site.
+        return applied ? .recorded : .noSession
     }
 
     public func isNeverRecord(_ routeId: String) -> Bool {

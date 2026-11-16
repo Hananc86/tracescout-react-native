@@ -85,6 +85,23 @@ class DurableUploadPipeline(
     private val park: ParkStore = ParkStore.none(),
     private val nowMillis: () -> Long = { System.currentTimeMillis() },
     /**
+ * **A MONOTONIC source, deliberately NOT [nowMillis].**
+ *
+ * The one thing measured with it is a DURATION — how long an exhausted
+ * F-15 carrier burst has been cooling — and a duration read from a wall
+ * clock is not a duration. `System.currentTimeMillis` jumps backwards on
+ * an NTP correction (the mobile protocol's own envelope rule says a
+ * backwards wall clock is legal, not an error), and a backwards jump here
+ * would either extend the cooldown arbitrarily or, if the sign were
+ * ignored, let clock jitter mint fresh request budget. `System.nanoTime`
+ * is monotonic by contract, so `now - then` is never negative and the
+ * cooldown needs no backwards-clock branch to reason about.
+ *
+ * Injectable for the same reason [sleeper] is: so a test can cross a
+ * five-minute boundary without waiting five minutes.
+ */
+    private val monotonicNanos: () -> Long = { System.nanoTime() },
+    /**
  * The unresolved-batch descriptor. See [InFlightStore].
  *
  * REQUIRED — NO DEFAULT, AND NO `memory` DOWNGRADE (Slice B, ruling
@@ -277,6 +294,60 @@ class DurableUploadPipeline(
  * network retry; only the governed reconciliation releases it.
  */
         RECONCILIATION_BLOCKED,
+
+        /**
+ * **F-15: a
+ * STRANDED pending loss checkpoint for this batch's session is
+ * UNRESOLVED after the carrier had its chance, and the fault that left
+ * it unresolved may clear on its own.** Refused BEFORE any data request:
+ * zero POST, zero dequeue, zero PARK, zero quarantine, zero removal, the
+ * claim left exactly as it is, and the no-progress counter NOT burned —
+ * nothing was posted.
+ *
+ * **WHY REFUSING IS SAFER THAN DELIVERING, which is the whole
+ * finding.** A claim is "stranded" when its frozen boundary is strictly
+ * BELOW the first sequence of the batch about to go out.
+ * [F6CheckpointEmitter] the specification/the specification re-sends an outstanding claim BY VALUE, so
+ * it would attach that boundary to a chunk whose last sequence is
+ * strictly greater — and the deployed ingest requires
+ * `chunk.lastSequence === lossCheckpoint.throughSequence`, answering
+ * `loss_checkpoint_through_not_chunk_aligned` with `retriable:false`.
+ * That is a PERMANENT refusal of the WHOLE chunk, so delivering is how
+ * the records are destroyed; retaining them is how they survive.
+ * Measured against the serving revision, verbatim on the bytes this
+ * pipeline emits.
+ *
+ * A bounded retry IS owed: the carrier faulted, answered 2xx without a
+ * loss block, or the authority could not be read — each of which a later
+ * drain may find different. The bound is a BURST of
+ * [F15_CARRIER_ATTEMPTS_PER_BURST] attempts; a spent burst keeps this
+ * disposition (`carrier_burst_cooling`) while
+ * [F15_CARRIER_BURST_COOLDOWN_MILLIS] elapses and is then forgiven, so
+ * recovered transport delivers the retained records without a restart.
+ * Only a DEFINITE server answer reaches [F15_CHECKPOINT_BLOCKED].
+ */
+        F15_CHECKPOINT_RETRY_OWED,
+
+        /**
+ * **F-15: the same refusal, with no automatic retry owed.** The server
+ * gave a DEFINITE answer that settled nothing — an `older` or
+ * wrong-per-family acknowledgement the binder declined.
+ *
+ * A SPENT CARRIER BURST NO LONGER REACHES HERE. It did, and that was
+ * the defect: a rate limit was being reported with the same finality as
+ * a server verdict, so three transient faults looked exactly like a
+ * permanent incompatibility. An exhausted burst is
+ * [F15_CHECKPOINT_RETRY_OWED] while it cools.
+ *
+ * DISTINCT FROM [F15_CHECKPOINT_RETRY_OWED] for the same reason
+ * `TERMINAL_MOVE_BLOCKED` is distinct from `TERMINAL_MOVE_PENDING`: both
+ * retain the bytes and arm no network deadline, but only one is owed a
+ * retry. Re-posting a carrier the server has already answered definitively
+ * replaces one wasted request with an unbounded series of them. The
+ * records are still RETAINED — a later launch, or a server that settles
+ * the claim, releases them.
+ */
+        F15_CHECKPOINT_BLOCKED,
     }
 
     /** Why the last drain ended. Read by the transport to schedule correctly. */
@@ -359,6 +430,313 @@ class DurableUploadPipeline(
 
     /** The logical fingerprint of the image this drain posted against. */
     private var drainEpoch: String = ""
+
+    /**
+ * **F-15 — the sessions whose stranded claim the SERVER has already declined
+ * to settle on the carrier. A PROCESS-LOCAL latch, exactly as F6's is.**
+ *
+ * IT IS ENTERED ONLY ON A DEFINITE NON-SETTLING ANSWER — a response that
+ * carried a parseable loss block and left the claim pending. A transport
+ * failure, an unreadable authority or a refused document do NOT enter it,
+ * because those are reasons to try again on the next drain and a latch set on
+ * them would convert a transient fault into a permanent refusal. That
+ * asymmetry is the difference between F6's `mismatched` (set only on
+ * self-contradictory ARITHMETIC) and a latch that damps everything.
+ *
+ * PROCESS-LOCAL BY CONSTRUCTION, AND THE CONSEQUENCE IS STATED: a restart
+ * asks once more. A DURABLE statement would be a new durable fact — a format
+ * change this slice is not authorised to make — so what this guarantees is
+ * the behaviour that matters, that one process makes at most ONE carrier
+ * attempt per session however many times it drains.
+ */
+    private val f15Declined = HashSet<String>()
+
+    /**
+ * **F-15 — how many carrier attempts one session may spend in ONE BURST.**
+ *
+ * The reconciliation makes at most one attempt per drain, so this bounds the
+ * number of DRAINS that may each spend one before the session has to wait.
+ *
+ * **THIS USED TO BE A PER-PROCESS TOTAL AND THAT WAS A PERMANENT
+ * PROCESS BAN.** Three transient faults — no network for thirty seconds, a
+ * proxy returning 502, a half-open socket — are not evidence that the server
+ * will never settle this claim, and the predecessor turned them into a
+ * terminal verdict for the life of the process: once the counter reached the
+ * bound the session answered `retryable = false` for ever, and the ONLY way
+ * recovered transport could deliver those retained records was for the host
+ * app to be relaunched. A bound on a BURST is a rate limit; a bound on a
+ * process is a ban, and nothing about a transient fault justifies one
+ * (lead decision `F15-BOUNDED-RECOVERY-INTEGRATION-20261103`).
+ *
+ * So the counter is now one burst's worth, and [f15CarrierBurstAt] records
+ * when the burst was spent so [f15Burst] can forgive it after a bounded
+ * cooldown. The forgiveness is a PREDICATE read by the next drain the
+ * EXISTING scheduler delivers — not a timer, not a wakeup, not a loop.
+ *
+ * STILL PROCESS-LOCAL, exactly like [f15Declined]: a relaunch starts from
+ * nothing. Persisting either one would be a new durable fact, and a bad hour
+ * must not outlive the process that had it.
+ */
+    private val f15CarrierAttempts = HashMap<String, Int>()
+
+    /**
+ * **F-15 — the monotonic instant one session's carrier burst was SPENT.**
+ *
+ * Written only when [f15CarrierAttempts] reaches
+ * [F15_CARRIER_ATTEMPTS_PER_BURST], read only by [f15Burst]. Absent means
+ * either the burst is not spent or this process never spent one.
+ */
+    private val f15CarrierBurstAt = HashMap<String, Long>()
+
+    /**
+ * **F-15 — carrier attempts made by the CURRENT drain, across all sessions.**
+ *
+ * Reset at the top of [uploadInner]. One drain crosses sessions, and each
+ * newly selected prefix may now ask for a carrier attempt with its own
+ * real boundary, so without this the request count per drain would scale
+ * with the number of sessions in the queue. Bounded by
+ * [F15_CARRIER_ATTEMPTS_PER_DRAIN], which keeps the property the
+ * predecessor's comment claimed — at most one carrier attempt per drain —
+ * as something enforced rather than something that happened to be true
+ * because there was only one attempt site.
+ */
+    private var f15DrainAttempts: Int = 0
+
+    /** Where one session's bounded carrier burst stands, right now. */
+    private enum class F15Burst {
+        /** Budget remains in this burst. */
+        FRESH,
+
+        /** Spent, and the bounded cooldown has NOT elapsed. Retry still owed. */
+        COOLING,
+
+        /** Spent, cooldown elapsed. The burst is forgiven on the next attempt. */
+        COOLED,
+    }
+
+    /**
+ * **F-15 — the boundary the batch about to go out will actually carry.**
+ *
+ * The deployed ingest compares `chunk.lastSequence` with the checkpoint's
+ * `throughSequence` for EQUALITY, so "is this claim aligned?" can only be
+ * answered against a chunk that exists. This type is what keeps the two
+ * questions apart instead of letting one stand in for the other.
+ */
+    private sealed class F15Boundary {
+        /**
+ * No chunk has been sized yet — the pre-batch screen. The only thing
+ * knowable here is the head record's own sequence, so the screen can
+ * prove a STRAND (`through` strictly below everything that could be
+ * selected) but can never prove ALIGNMENT.
+ */
+        object Unsized : F15Boundary()
+
+        /**
+ * A chunk exists and [value] is its own last sequence, read from the
+ * batch identity derived from the exact records in it. `-1` means the
+ * batch's own last sequence could not be parsed.
+ */
+        class Last(val value: Long) : F15Boundary()
+    }
+
+    /**
+ * **F-15 — the drain's answer about one session's stranded claim.**
+ *
+ * Returned by [f15GateFor] and by [reconcileStrandedPendingCheckpoint] so the
+ * caller cannot ignore it. The predecessor returned `Unit` and
+ * [uploadInner]'s call site discarded every failure, which is the defect the
+ * lead's ruling names: a reconciliation that could not settle the claim was
+ * indistinguishable from one that did, and the drain walked straight on into
+ * a delivery the deployed ingest refuses permanently.
+ */
+    private sealed class F15Gate {
+        /**
+ * Deliver. Either the authority holds no claim, or it holds one whose
+ * boundary is NOT strictly below this batch — which is not the F-15
+ * shape and is the ordinary matching-boundary case.
+ */
+        object Clear : F15Gate()
+
+        /**
+ * Do NOT deliver this session. [why] is the typed trace reason.
+ *
+ * [retryable] — a later drain may find this different (a fault), as
+ * opposed to a definite answer or an exhausted budget.
+ *
+ * [attemptable] — a carrier re-send is a MEANINGFUL action right now.
+ * True for exactly one reason: the claim was PROVEN pending and nothing
+ * has refused it yet. It is deliberately FALSE for `authority_unreadable`
+ * a request built on a boundary we could not read would be a request
+ * made on a boundary we invented, and the post-settlement verification
+ * would be just as unreadable, so the attempt could never be confirmed
+ * either. It is also false for a definite decline and for an exhausted
+ * budget, where a request cannot change the answer.
+ */
+        class Unresolved(
+            val why: String,
+            val retryable: Boolean,
+            val attemptable: Boolean = false,
+        ) : F15Gate()
+    }
+
+    /**
+ * **F-15 — THE ONE PREDICATE. Is a stranded claim unresolved for [session]
+ * against a batch beginning at [batchFirst]?**
+ *
+ * A pure durable READ: it posts nothing, writes nothing and creates nothing,
+ * so it is safe to ask for every newly selected session prefix in a drain.
+ *
+ * `batchFirst < 0` (a head record whose sequence could not be read) is
+ * treated as UNRESOLVED-retryable rather than clear. The comparison that
+ * decides safety is `through < batchFirst`, and a batch whose own first
+ * sequence is unknown cannot be shown to be above any boundary.
+ *
+ * **[boundary] IS WHAT MAKES THIS THE SERVER'S QUESTION RATHER THAN A
+ * WEAKER ONE.** The predecessor asked `through >= batchFirst` and called
+ * that aligned, which is MEASURABLY NOT the deployed rule: the ingest
+ * requires `chunk.lastSequence === throughSequence`, so a claim sitting
+ * INSIDE the batch — `batchFirst <= through < batchLast` — passed this gate,
+ * F6 the specification/the specification re-attached it BY VALUE to a chunk whose last sequence is
+ * strictly greater, and the chunk took the same permanent
+ * `loss_checkpoint_through_not_chunk_aligned` refusal the gate exists to
+ * prevent. `>= batchFirst` is a screen for a chunk that does not exist yet;
+ * it is NEVER a proof of alignment, and [F15Boundary] is what stops it being
+ * read as one (lead decision `F15-BOUNDED-RECOVERY-INTEGRATION-20261103`).
+ */
+    private fun f15GateFor(
+        session: String,
+        batchFirst: Long,
+        boundary: F15Boundary = F15Boundary.Unsized,
+    ): F15Gate {
+        if (session.isBlank()) return F15Gate.Clear
+        // A SINK THAT THROWS IS `Unreadable`, NOT AN EXCEPTION OUT OF THE
+        // DRAIN. The production sink catches internally and reports
+        // `PendingClaim.Unreadable`, but `AttributionSink` is a PUBLIC interface
+        // and an embedder's implementation may throw — measured: a throwing
+        // double propagated straight out of `upload`. Letting it escape would
+        // turn a read failure into a crash in the host app, and catching it as
+        // `Clear` would be the conflation this whole change exists to remove, so
+        // it is caught as UNKNOWN. `SimulatedProcessDeath` still propagates: it
+        // is the test seam that models a kill, and swallowing it would make a
+        // death look like a read failure.
+        val claim = try {
+            attribution.f7PendingClaim(session)
+        } catch (t: Throwable) {
+            if (t is SimulatedProcessDeath) throw t
+            AttributionSink.PendingClaim.Unreadable(t.javaClass.simpleName)
+        }
+        return when (claim) {
+            // Proven absence — including a session with no authority at all,
+            // which is the compatibility path and must gate nothing.
+            is AttributionSink.PendingClaim.None -> F15Gate.Clear
+            // UNKNOWN, never absent. See AttributionSink.PendingClaim.Unreadable.
+            is AttributionSink.PendingClaim.Unreadable ->
+                F15Gate.Unresolved("authority_unreadable", retryable = true)
+            is AttributionSink.PendingClaim.Pending -> when {
+                batchFirst < 0L -> F15Gate.Unresolved("batch_first_unreadable", retryable = true)
+                // A sized chunk whose OWN last sequence cannot be parsed is the
+                // same class of unknown: the equality that decides safety has no
+                // right-hand side, so nothing can be shown aligned.
+                boundary is F15Boundary.Last && boundary.value < 0L ->
+                    F15Gate.Unresolved("batch_last_unreadable", retryable = true)
+                f15Aligned(claim.throughSequence, batchFirst, boundary) -> F15Gate.Clear
+                else -> f15Stranded(session)
+            }
+        }
+    }
+
+    /**
+ * **Can F6's by-value re-send of a claim at [through] be ACCEPTED by the
+ * batch [boundary] describes?**
+ *
+ * The deployed rule, verbatim: `big(chunk.lastSequence) === inThrough`. So
+ * for a chunk that exists this is EQUALITY and nothing weaker — not `>=`,
+ * not a window, not a high-water. A claim above the chunk's last is just as
+ * misaligned as one below it (the queue can shrink: a session prefix that
+ * ends earlier than the one the claim was frozen against produces exactly
+ * that), and treating "above" as safe is the same mistake as treating
+ * "inside" as safe.
+ *
+ * For an UNSIZED batch the honest answer is the weaker screen that is all
+ * the information permits: a claim strictly below the head record's sequence
+ * is PROVABLY stranded whatever the chunk turns out to be, because every
+ * record in it is above the claim. Anything else is "cannot tell yet", and
+ * cannot-tell has to read as aligned here or the pre-batch screen would
+ * refuse every ordinary matching-boundary re-delivery. The sized gate inside
+ * the slice loop is the one that decides.
+ */
+    private fun f15Aligned(through: Long, batchFirst: Long, boundary: F15Boundary): Boolean =
+        when (boundary) {
+            is F15Boundary.Last -> through == boundary.value
+            is F15Boundary.Unsized -> through >= batchFirst
+        }
+
+    /**
+ * The claim is stranded against this batch. Which of the three stranded
+ * states is it in?
+ *
+ * A definite decline is not owed a retry. A SPENT-and-cooling burst IS owed
+ * one — it is a rate limit that has not expired, not a verdict — which is
+ * the whole correction over the predecessor, where an exhausted budget
+ * answered `retryable = false` and banned the session for the process.
+ */
+    private fun f15Stranded(session: String): F15Gate.Unresolved = when {
+        f15Declined.contains(session) ->
+            F15Gate.Unresolved("carrier_declined", retryable = false)
+        f15Burst(session) == F15Burst.COOLING ->
+            F15Gate.Unresolved("carrier_burst_cooling", retryable = true)
+        // THE ATTEMPTABLE STATE: a boundary we have actually read, misaligned
+        // with this batch, that nothing has refused and no live rate limit
+        // covers.
+        else -> F15Gate.Unresolved("claim_unsettled", retryable = true, attemptable = true)
+    }
+
+    /**
+ * **Where one session's bounded carrier burst stands — a PURE READ.**
+ *
+ * The cooldown is measured with [monotonicNanos], so `waited` can never
+ * be negative and there is no backwards-clock case to reason about. It is
+ * also not a timer: nothing is scheduled, nothing wakes up. The next drain
+ * the EXISTING backoff/flush scheduling delivers reads this predicate and
+ * finds the burst forgiven — which is why recovered transport gets through
+ * without a process restart, a new background timer or a hot loop.
+ */
+    private fun f15Burst(session: String): F15Burst {
+        val spent = f15CarrierAttempts[session] ?: 0
+        if (spent < F15_CARRIER_ATTEMPTS_PER_BURST) return F15Burst.FRESH
+        // Spent with no recorded instant cannot be told apart from spent long
+        // ago, and the safe reading of an unknown rate limit is that it has
+        // expired: it grants one bounded attempt, and an attempt can only
+        // RETAIN or settle — it never deletes a record.
+        val at = f15CarrierBurstAt[session] ?: return F15Burst.COOLED
+        val waited = monotonicNanos() - at
+        return if (waited >= F15_CARRIER_BURST_COOLDOWN_MILLIS * 1_000_000L) F15Burst.COOLED
+        else F15Burst.COOLING
+    }
+
+    /**
+ * Refuse the drain on an unresolved F-15 claim: typed disposition, typed
+ * local result, one trace, and NOTHING else. No mutation of any kind.
+ */
+    private fun f15Refuse(session: String, batchFirst: Long, g: F15Gate.Unresolved) {
+        // NAMED LOCALS, for exactly the reason `batchFirst` is one.
+        // `RecoveryTracePrivacyTest` admits documented bounded NAMES as trace
+        // values; a property read (`g.why`) and an elvis expression are not
+        // among them, and the guard caught all three of mine. `why` is a typed
+        // code from this file's own closed vocabulary and `retryable` is a plain
+        // boolean — the shape `settled` / `latched` / `fresh` already are.
+        val why = g.why
+        val retryable = g.retryable
+        RecoveryTrace.log("f15_delivery_refused",
+            "session" to session.take(24),
+            "batchFirst" to batchFirst,
+            "why" to why,
+            "retryable" to retryable)
+        results.last = localRefusal(
+            if (g.retryable) "f15_checkpoint_unresolved" else "f15_checkpoint_blocked")
+        disposition = if (g.retryable) Disposition.F15_CHECKPOINT_RETRY_OWED
+                      else Disposition.F15_CHECKPOINT_BLOCKED
+    }
 
     /** A typed local refusal, expressed in the transport's own result type: no server was asked. */
     private fun localRefusal(code: String): Uploader.Result =
@@ -597,6 +975,10 @@ class DurableUploadPipeline(
     }
 
     private fun uploadInner(records: List<ByteArray>, fallbackSessionId: String) {
+        // F-15 — a fresh per-drain carrier budget. See [f15DrainAttempts]. The
+        // per-SESSION burst counter is deliberately NOT reset here: that one
+        // spans drains, which is the whole point of bounding a burst.
+        f15DrainAttempts = 0
         // An empty queue must not produce a request at all. A round trip that
         // could only ever be answered "nothing happened" is an invitation to
         // read a 2xx as progress.
@@ -755,6 +1137,50 @@ class DurableUploadPipeline(
             }
         }
 
+        // ── F-15 — RECONCILE A STRANDED PENDING CLAIM BEFORE ANY CHUNK IS SIZED
+        // OR FROZEN. One attempt, at most, per drain. ────────────────
+        //
+        // **IT IS HERE AND NOT IN THE EMPTY BRANCH, AND THAT IS THE WHOLE
+        // POINT.** F7's existing production trigger lives inside
+        // `if (records.isEmpty)`, so it cannot reach a NON-EMPTY recovery
+        // drain — which is the only shape F-15 occurs in. Widening that
+        // branch's predicate would not help: there is no empty drain in the
+        // crash-recovery path, because the crash records ARE the queue.
+        //
+        // **AND IT IS BEFORE THE SLICE LOOP, NOT INSIDE IT.** Two reasons,
+        // both load-bearing. `sessionOwnedPrefix` sizes the slice with F6's
+        // reserve (`reserveFor`), so reconciling first means the reserve
+        // describes the document that will actually be attached rather than the
+        // stranded one. And the slice loop's terminal branches `continue@slices`,
+        // so a reconciliation inside it could run more than once per drain.
+        //
+        // **A RESUMED BATCH IS EXCLUDED BY NAME.** Its body was frozen with
+        // whatever F6 attached on the first attempt, and the unresolved-batch
+        // invariant requires the retry to rebuild BYTE-IDENTICAL bytes. Settling
+        // the claim would make F6 attach NOTHING on the retry (`pending == null`
+        // + `resuming` -> `resume_no_pending_claim`), the digests would disagree,
+        // and `inflight_rebuild_mismatch` would stop the pipeline. So a
+        // descriptor that already carries a misaligned checkpoint is left exactly
+        // as it is today — no regression, and no improvement either; it is named
+        // in the report rather than silently half-handled.
+        // **THE ANSWER IS ACTED ON NOW. THE PREDECESSOR DISCARDED IT.**
+        // This call returned `Unit` and the drain walked on regardless, so a
+        // carrier that threw, answered 2xx with no loss block, was declined by
+        // the binder, or could not be verified afterwards each left the stranded
+        // claim outstanding — and F6 the specification/the specification then re-attached it BY VALUE to the
+        // very next chunk, which the deployed ingest refuses PERMANENTLY, taking
+        // the whole chunk and the crash inside it. Refusing here RETAINS the
+        // records instead of destroying them; nothing is posted, dequeued,
+        // parked, quarantined or removed, and the claim is left exactly as it is.
+        if (resume == null) {
+            val g = reconcileStrandedPendingCheckpoint(rest)
+            if (g is F15Gate.Unresolved) {
+                val hf = rest.firstOrNull()?.let { LossAuthority.RecordFields.parse(it) }
+                f15Refuse(hf?.sessionId ?: fallbackSessionId, hf?.sequence ?: -1L, g)
+                return
+            }
+        }
+
         // LABELLED. The terminal branches below sit inside the inner
         // RETRY loop, so a bare `continue` there advances the RETRY, not
         // the slice — which sends the SAME batch again and turns "exactly
@@ -794,6 +1220,82 @@ class DurableUploadPipeline(
             }
             val n = slice.size
             val batch = BatchIdentity.of(batchSession, slice)
+
+            // **F-15 — EVERY NEWLY SELECTED SESSION PREFIX IS ASKED, NOT
+            // ONLY THE ORIGINAL `rest` HEAD.** A drain CROSSES SESSIONS: the
+            // reconciliation above runs once, against the head record's session,
+            // and then this loop delivers that prefix, advances `rest` and
+            // selects a prefix belonging to a DIFFERENT session. Gating only the
+            // head would let the second session's stranded claim ride the second
+            // chunk — the same permanent refusal, reached one slice later.
+            //
+            // A RESUME IS EXCLUDED BY NAME (`pending == null`). Its body was
+            // frozen with whatever F6 attached on the first attempt and the
+            // unresolved-batch invariant requires the retry to rebuild
+            // BYTE-IDENTICAL bytes; refusing it here would neither settle the
+            // claim nor change those bytes, and asking the authority a question
+            // whose answer cannot alter the outcome is how a guard acquires a
+            // false purpose. A descriptor that already carries a misaligned
+            // checkpoint stays exactly as it is today — named in the report.
+            //
+            // IT IS A PURE READ, so asking per slice costs one durable read
+            // per newly selected session and mutates nothing. This session is
+            // only ATTEMPTED (a carrier POST) when it is the head of a drain, so
+            // the "at most one carrier attempt per drain" property is unchanged:
+            // a crossed-into session is refused here and reconciled on the next
+            // drain, where it IS the head. That is forward progress, not a
+            // stall — the prefix in front of it has already been delivered and
+            // removed.
+            //
+            // **AND THIS IS THE ONLY SITE THAT KNOWS THE BOUNDARY THE
+            // SERVER WILL COMPARE AGAINST.** `batch` was derived from the exact
+            // records going out, so `batch.lastSequence` IS `chunk.lastSequence`
+            // the right-hand side of the deployed equality. The pre-batch
+            // screen above cannot have it (nothing is sized yet), so the
+            // `batchFirst <= through < batchLast` mixed case is INVISIBLE there
+            // and visible here. That also makes this the site that must be able
+            // to ATTEMPT: a mixed-case claim the screen waved through would
+            // otherwise be refused here on every drain for ever, with no request
+            // ever made to settle it — retention without recovery.
+            if (pending == null) {
+                val bFirst = batch.firstSequence.toLongOrNull() ?: -1L
+                val bLast = batch.lastSequence.toLongOrNull() ?: -1L
+                val sized = F15Boundary.Last(bLast)
+                var g = f15GateFor(batchSession, bFirst, sized)
+                // **THIS SITE ATTEMPTS FOR `batchSession` WHATEVER THE
+                // RECORDS SAY ABOUT THEMSELVES, AND AN EARLIER VERSION OF THIS
+                // CHANGE GOT THAT WRONG.** It carried a guard requiring the
+                // slice's head record to NAME `batchSession`, reasoning from the
+                // pre-batch screen's rule that a claim must never be reconciled
+                // "on behalf of the fallback". The rule is right where it is
+                // stated and does not apply here, and a review finding
+                // (CodeRabbit #4455080144) showed the guard created something
+                // worse than the case it excluded: an unattributable head under a
+                // session whose claim is stranded was refused on EVERY drain with
+                // no request ever made — retention with no recovery, which is the
+                // exact words of the comment two paragraphs above.
+                //
+                // The distinction the guard missed: whose CLAIM is being settled
+                // is not the same question as whose RECORDS these are. The carrier
+                // re-sends `batchSession`'s OWN durable claim, keyed on
+                // `batchSession`, and that is the identical request the pre-batch
+                // screen makes when that session is the drain head. Nothing is
+                // settled on anyone else's behalf. What the unattributable record
+                // decides is only which session the chunk is ADDRESSED under — a
+                // permissive upload address, pre-existing and not this gate's
+                // subject — and F6 attaches that session's claim regardless, which
+                // is precisely why the delivery had to be gated and why the
+                // settlement must be reachable.
+                if (g is F15Gate.Unresolved && g.attemptable) {
+                    // One carrier attempt, against the REAL boundary, bounded by
+                    // the per-drain budget inside the reconciliation.
+                    g = reconcileStrandedPendingCheckpoint(batchSession, bFirst, sized)
+                }
+                if (g is F15Gate.Unresolved) {
+                    f15Refuse(batchSession, bFirst, g)
+                    return
+                }
+            }
 
             // ZERO HTTP FOR A SESSION ALREADY PROVEN TERMINAL. The device
             // learned this fact once, durably; a later slice of the same dead
@@ -1011,6 +1513,43 @@ class DurableUploadPipeline(
             var attempt = 1
             while (attempt <= maxRetries) {
                 RecoveryTrace.log("transport_enter", "attempt" to attempt)
+                // THE OWNERSHIP GATE IS AT THE POST BOUNDARY, NOT AT THE
+                // BOOTSTRAP, AND THAT IS THE WHOLE FIX. `projectId` is a
+                // CONSTRUCTOR property of this pipeline — ONE value for every
+                // slice the drain loop produces — so a guard that ran once over
+                // the queue before the loop (which is what the bootstrap's
+                // `crossProjectRefusal` is) can only ever vouch for the FIRST
+                // slice. A second session's records, sliced on a later
+                // iteration, reached this line carrying no claim of their own.
+                //
+                // Placing it inside the attempt loop is deliberate on three
+                // counts. It is the LAST statement before the request, so no
+                // path that reaches a record-carrying post can bypass it. It
+                // therefore also covers the RESUMED path — `pending != null`
+                // above re-slices a persisted descriptor byte-identically, and
+                // a descriptor frozen under one tenant must not be replayed
+                // under another's credential just because it survived a
+                // process. And it re-evaluates per attempt, so a retry is
+                // gated exactly as the first try is.
+                sliceProjectRefusal(slice)?.let { why ->
+                    // NON-SENDING, and the queue is untouched: no record is
+                    // removed, parked or quarantined, and no terminal loss is
+                    // invented. The frozen descriptor stays on purpose — the
+                    // next drain resumes these exact bytes, and when it runs
+                    // under the credential that DOES own them the resume
+                    // delivers and settles them with the same chunk id, so a
+                    // mis-scoped process costs a retry and never a record.
+                    RecoveryTrace.log(
+                        "post_refused_ownership",
+                        "why" to why,
+                        "chunk" to batch.chunkId.take(12),
+                        "recordCount" to n,
+                        "attempt" to attempt,
+                    )
+                    results.last = localRefusal(why)
+                    disposition = Disposition.RETRYABLE_REMAINING
+                    return
+                }
                 RecoveryTrace.log("http_request_started", "attempt" to attempt)
                 drainPosted++
                 val r = poster.post(projectId, body)
@@ -2187,33 +2726,286 @@ class DurableUploadPipeline(
                 "session" to sessionId.take(24))
             return MetadataOnly.NotSent(t.javaClass.simpleName)
         } ?: return MetadataOnly.NotEmitted
+        return postCarrierDocument(
+            sessionId, doc,
+            requestEvent = "f7_metadata_only_request",
+            retryEvent = "f7_metadata_only_retry",
+            transportEvent = "f7_metadata_only_transport_failed",
+            unackEvent = "f7_metadata_only_unacknowledged",
+        )
+    }
+
+    /**
+ * **ONE `events: []` CARRIER EMISSION — the post, the trace and the
+ * settlement, shared by every caller that has a document to carry.**
+ *
+ * **EXTRACTED RATHER THAN COPIED, and this file's own rules are why.**
+ * F-15's reconciliation needs the same three steps, and a second copy would
+ * be a second SETTLEMENT home — the exact thing
+ * [emitMetadataOnlyCheckpoint]'s own KDoc forbids ("No second settlement
+ * home"). What varies between callers is which DOCUMENT they carry and which
+ * event names they trace under; nothing about the post or the settlement
+ * varies, so nothing about it is duplicated.
+ *
+ * **THE EVENT NAMES ARE LITERALS AT THE CALL SITES, not a computed
+ * prefix.** A grep for `f7_metadata_only_request` must still find the R-2
+ * path and only the R-2 path; a name assembled here would make every trace
+ * event in this family unfindable from its own name.
+ *
+ * TWO LITERAL NAMES FOR request-vs-retry, NOT A `retry` VALUE.
+ * `RecoveryTracePrivacyTest` allows only a curated set of bounded value
+ * shapes, and widening a PRIVACY allowlist for a diagnostic flag is the wrong
+ * trade; the event name carries the distinction instead and is not a value
+ * expression at all.
+ *
+ * IT TOUCHES NO RECORD AND NO DISPOSITION — there are no records in a
+ * carrier request. It takes no queue region, removes nothing, parks nothing,
+ * quarantines nothing, and never changes the drain's disposition, the reslice
+ * budgets, the in-flight descriptor or the delivery protection.
+ */
+    private fun postCarrierDocument(
+        sessionId: String,
+        doc: AttributionSink.MetadataOnlyDocument,
+        requestEvent: String,
+        retryEvent: String,
+        transportEvent: String,
+        unackEvent: String,
+    ): MetadataOnly {
         // The ONE body encoder, with an EMPTY slice: `"events":[]`.
         val body = encodeBody(sessionId, doc.chunkId, emptyList(), doc.json)
-        // TWO LITERAL EVENT NAMES, NOT A `retry` VALUE. `RecoveryTracePrivacyTest`
-        // allows only a curated set of bounded value shapes, and widening a PRIVACY
-        // allowlist for a diagnostic flag is the wrong trade; the event name carries
-        // the distinction instead and is not a value expression at all.
         RecoveryTrace.log(
-            if (doc.retry) "f7_metadata_only_retry" else "f7_metadata_only_request",
+            if (doc.retry) retryEvent else requestEvent,
             "session" to sessionId.take(24), "chunk" to doc.chunkId.take(12),
             "bytes" to body.size)
         val r = try {
             poster.post(projectId, body)
         } catch (t: Throwable) {
             if (t is SimulatedProcessDeath) throw t
-            RecoveryTrace.log("f7_metadata_only_transport_failed", "code" to t.javaClass.simpleName)
+            RecoveryTrace.log(transportEvent, "code" to t.javaClass.simpleName)
             return MetadataOnly.NotSent(t.javaClass.simpleName)
         }
         // THE PARSED LOSS BLOCK IS THE ONLY TRIGGER, exactly as on the
         // delivered-chunk path. A 2xx with no block settles nothing.
         val loss = r.lossAck
         if (loss == null) {
-            RecoveryTrace.log("f7_metadata_only_unacknowledged",
-                "status" to r.status, "code" to (r.code ?: ""))
+            RecoveryTrace.log(unackEvent, "status" to r.status, "code" to (r.code ?: ""))
             return MetadataOnly.Unacknowledged(r.status, r.code)
         }
         settleLossCheckpoint(sessionId, loss)
         return MetadataOnly.Acknowledged(loss.state)
+    }
+
+    /**
+ * **F-15 — SETTLE A STRANDED PENDING CLAIM ON THE CARRIER, SO THE CHUNK
+ * BEHIND IT CAN GO OUT WITH ITS OWN ALIGNED CHECKPOINT.**
+ *
+ * The defect, measured end to end on real device bytes (an earlier change's sealed
+ * API-26 Cordova leg, replayed through the DEPLOYED handler by an earlier change):
+ *
+ * ```
+ * chunk [0.6] + checkpoint through=6 -> 202, server commits through=6
+ *. the process DIES before the ack is applied; the claim stays pending
+ * chunk [7,8,9] + the SAME claim by value (F6 the specification/the specification, through=6)
+ * -> 422 loss_checkpoint_through_not_chunk_aligned {chunkLast:9, through:6}
+ * retriable:false -> THE WHOLE CHUNK IS REFUSED, crash record included
+ * ```
+ *
+ * **IT IS STRUCTURAL, NOT A RACE.** `LossLedger.freeze` stores
+ * `throughSequence = <the chunk's own last>`, so a pending claim's boundary
+ * is ALWAYS a PREVIOUS chunk's last sequence; the server requires
+ * `chunk.lastSequence === inThrough`; and a later chunk's last is strictly
+ * greater. "Frozen by value" and "aligned to THIS chunk" are therefore
+ * mutually exclusive for every recovery delivery, always — so advancing the
+ * boundary is not an option either (that is a fresh claim, and on a lossy
+ * recovery it answers `unaccounted_sequence_gap`).
+ *
+ * **The one move that invents nothing:** the carrier route has NO chunk, so
+ * the alignment rule does not apply to it. Re-send the claim THERE, by
+ * value, let the server acknowledge it, and the next batch emits a FRESH
+ * checkpoint aligned to its own last sequence.
+ *
+ * **NOTHING IS FABRICATED, CLEARED OR ADVANCED.** The boundary, the
+ * per-family counts and the terminal flag all travel from the durable row
+ * through the ONE wire writer. The pending slot is cleared ONLY by the
+ * server's own `loss-checkpoint-ack-1` through the existing binder, which
+ * requires session, boundary AND canonical-equal counts to match the frozen
+ * row — so a local clear is not merely avoided, it is unreachable from here.
+ * The session is NOT finalized: `f7PendingCheckpointRetry` is not gated on
+ * terminality and the document carries `terminal` from the row.
+ *
+ * **`through >= first` IS A NO-OP, DELIBERATELY.** The condition is that
+ * the claim's boundary lies STRICTLY BELOW everything in the batch about to
+ * go out — which is exactly when F6's by-value re-send is provably
+ * misaligned. A claim whose boundary is inside or above this batch is not
+ * the F-15 shape and the carrier is not obviously the right answer for it, so
+ * this does nothing and says nothing.
+ */
+    private fun reconcileStrandedPendingCheckpoint(rest: List<ByteArray>): F15Gate {
+        // THE SESSION COMES FROM THE RECORDS, NEVER FROM THE FALLBACK. A
+        // crash-recovery batch carries the PREVIOUS session's records, and the
+        // fallback is the LIVE session — the one that structurally cannot own a
+        // stranded claim. Reconciling the fallback would settle a claim for the
+        // wrong session. A head record whose owner cannot be read is therefore a
+        // no-op, not a guess (SF-8: a permissive upload address is not an
+        // authority key).
+        // AN UNREADABLE HEAD IS `Clear`, NOT `Unresolved`. It is not an F-15
+        // state: with no session to key an authority by there is no claim to
+        // strand, and refusing here would halt every drain whose head record is
+        // a shape `RecordFields` cannot parse — a regression with no F-15
+        // subject. The gate inside the slice loop asks again per prefix.
+        val head = rest.firstOrNull() ?: return F15Gate.Clear
+        val f = LossAuthority.RecordFields.parse(head) ?: return F15Gate.Clear
+        val session = f.sessionId
+        if (session.isBlank() || f.sequence < 0L) return F15Gate.Clear
+        // The pre-batch screen: nothing is sized, so the boundary is UNSIZED and
+        // only a provable strand (`through` strictly below the head record) is
+        // actionable here. See [F15Boundary].
+        return reconcileStrandedPendingCheckpoint(session, f.sequence, F15Boundary.Unsized)
+    }
+
+    /**
+ * The reconciliation itself, against a stated [boundary]. ONE attempt site:
+ * both call sites land here, so "may this session deliver, and did a carrier
+ * request change the answer?" has exactly one implementation.
+ */
+    private fun reconcileStrandedPendingCheckpoint(
+        session: String,
+        batchFirstSequence: Long,
+        boundary: F15Boundary,
+    ): F15Gate {
+
+        // `batchFirst` IS A NAMED LOCAL BECAUSE THE TRACE MUST CARRY IT.
+        // `RecoveryTracePrivacyTest` admits only documented bounded shapes as
+        // trace VALUES, and a bare `f.sequence` property read is not one of
+        // them; a sequence number is the same class as `gen` / `highWater` /
+        // `next`, which the allowlist names, so the fix is to say so with a
+        // name rather than to widen the allowlist for an expression shape.
+        val batchFirst = batchFirstSequence
+
+        // **THE PREDECESSOR SHORT-CIRCUITED ON THE LATCH AND RETURNED, WHICH
+        // MADE THE LATCH WORSE THAN NO LATCH.** `f15Declined` stopped the carrier
+        // attempt — correctly, the server had answered definitively — and then
+        // the drain proceeded to POST the chunk the claim would be re-attached
+        // to. The latch therefore guaranteed the destructive delivery it was
+        // supposed to be protecting against. The state is now ASKED rather than
+        // short-circuited: a latched session with a stranded claim answers
+        // `Unresolved(carrier_declined)` and blocks the delivery too.
+        val before = f15GateFor(session, batchFirst, boundary)
+        // Clear, or unresolved in a way a carrier request cannot help: a definite
+        // decline, a live rate limit, or an authority we could not read. Report
+        // it and spend nothing.
+        if (before !is F15Gate.Unresolved || !before.attemptable) return before
+
+        // THE PER-DRAIN BUDGET IS CHECKED HERE, AT THE ONE ATTEMPT SITE. A
+        // drain crosses sessions and each newly selected prefix may now ask, so
+        // without this the requests per drain would scale with the queue. The
+        // refusal is RETRYABLE: the next drain's budget is fresh, and the
+        // records are retained meanwhile.
+        if (f15DrainAttempts >= F15_CARRIER_ATTEMPTS_PER_DRAIN) {
+            RecoveryTrace.log("f15_reconcile_skipped", "why" to "drain_budget",
+                "session" to session.take(24))
+            return F15Gate.Unresolved("carrier_drain_budget", retryable = true)
+        }
+
+        val doc = try {
+            attribution.f7PendingCheckpointRetry(session)
+        } catch (t: Throwable) {
+            if (t is SimulatedProcessDeath) throw t
+            RecoveryTrace.log("f15_reconcile_skipped", "why" to "document_unavailable",
+                "session" to session.take(24))
+            // The claim is still there and we could not even build the document.
+            return F15Gate.Unresolved("document_unavailable", retryable = true)
+        }
+        if (doc == null) {
+            // The emitter refused — a disabled session, an unreadable authority,
+            // or the claim settled between the two reads. The first two leave the
+            // claim outstanding; the third does not, and only re-asking the
+            // authority can tell them apart, so the gate decides rather than this
+            // branch guessing.
+            RecoveryTrace.log("f15_reconcile_skipped", "why" to "emitter_omitted",
+                "session" to session.take(24))
+            return when (val g = f15GateFor(session, batchFirst, boundary)) {
+                is F15Gate.Clear -> g
+                is F15Gate.Unresolved -> F15Gate.Unresolved("emitter_omitted", retryable = true)
+            }
+        }
+        // **A COOLED BURST IS FORGIVEN HERE, AT THE ONE MUTATION SITE.**
+        // [f15Burst] is a pure read asked per prefix; clearing the counter from
+        // it would make a documented pure read mutate. So the forgiveness lands
+        // where the budget is spent: a burst whose cooldown has elapsed is
+        // DISCARDED before counting, which is what makes the next attempt the
+        // FIRST of a fresh bounded burst rather than a fourth that overruns the
+        // bound. Nothing durable is written and no second request is made.
+        if (f15Burst(session) == F15Burst.COOLED) {
+            val forgiven = f15CarrierAttempts.remove(session) ?: 0
+            f15CarrierBurstAt.remove(session)
+            RecoveryTrace.log("f15_burst_forgiven",
+                "session" to session.take(24), "spent" to forgiven)
+        }
+        // THE ATTEMPT IS COUNTED BEFORE THE REQUEST, NOT AFTER. A carrier POST
+        // that throws, or a process killed mid-flight, must still have consumed
+        // budget — otherwise an attempt that always dies at the same point is
+        // free and the bound cannot be reached.
+        val attempt = (f15CarrierAttempts[session] ?: 0) + 1
+        f15CarrierAttempts[session] = attempt
+        f15DrainAttempts += 1
+        // The instant the burst was SPENT, so [f15Burst] can time the cooldown
+        // from it. Written on the attempt that reaches the bound, never earlier:
+        // a cooldown that started before the budget ran out would shorten it.
+        if (attempt >= F15_CARRIER_ATTEMPTS_PER_BURST) {
+            f15CarrierBurstAt[session] = monotonicNanos()
+        }
+        RecoveryTrace.log("f15_reconcile_attempt",
+            "session" to session.take(24), "batchFirst" to batchFirst,
+            "attempt" to attempt)
+        val outcome = postCarrierDocument(
+            session, doc,
+            requestEvent = "f15_reconcile_request",
+            retryEvent = "f15_reconcile_retry",
+            transportEvent = "f15_reconcile_transport_failed",
+            unackEvent = "f15_reconcile_unacknowledged",
+        )
+        // **THE OUTCOME IS READ FROM THE AUTHORITY, NOT FROM THE RESPONSE.**
+        // A 202 is not settlement and `Acknowledged` only means a loss block was
+        // routed: `older` is well-formed and settles NOTHING, and the binder can
+        // decline on counts or protocol. The only honest question is whether the
+        // claim is still pending, so that is the one asked — and it is asked of
+        // the durable authority, after the fact.
+        //
+        // AND `settled` IS NOW A PROVEN ABSENCE, NEVER AN UNREADABLE ONE. The
+        // predecessor read a bare `Long` and treated the `-1` an unreadable
+        // authority returns as "the claim is gone", so a post-settlement read
+        // that FAILED reported success and released the delivery.
+        val after = try {
+            attribution.f7PendingClaim(session)
+        } catch (t: Throwable) {
+            if (t is SimulatedProcessDeath) throw t
+            AttributionSink.PendingClaim.Unreadable(t.javaClass.simpleName)
+        }
+        val settled = after is AttributionSink.PendingClaim.None
+        if (!settled && after !is AttributionSink.PendingClaim.Unreadable &&
+            outcome is MetadataOnly.Acknowledged
+        ) {
+            // The server ANSWERED with a loss block and the claim PROVABLY
+            // survived it, so this carrier cannot settle it. Latch, so one
+            // process makes one attempt — and only on this definite answer,
+            // never on a transport fault, an unacknowledged response, or a
+            // post-settlement read we could not perform.
+            f15Declined.add(session)
+        }
+        // A NAMED LOCAL, for the same reason as `batchFirst`: the trace value
+        // must be a documented bounded shape, and `latched` is the shape
+        // `settled` already is — a plain boolean fact.
+        val latched = f15Declined.contains(session)
+        RecoveryTrace.log("f15_reconcile_outcome",
+            "session" to session.take(24),
+            "result" to outcome.javaClass.simpleName,
+            "settled" to settled,
+            "latched" to latched)
+        // THE ANSWER THE CALLER ACTS ON. Re-derived from the authority through
+        // the same predicate the slice loop uses, against the SAME boundary, so
+        // "may this session deliver?" has exactly one implementation.
+        return f15GateFor(session, batchFirst, boundary)
     }
 
     /**
@@ -2372,6 +3164,74 @@ class DurableUploadPipeline(
         if (key == "sessionId") LossAuthority.RecordFields.parse(b)?.sessionId
         else try { org.json.JSONObject(String(b, Charsets.UTF_8)).optString(key) } catch (_: Throwable) { null }
 
+    /**
+ * Why this SLICE may not be posted under [projectId] — `null` when it may.
+ *
+ * **IT SLICES NOTHING.** The caller already holds the exact records the
+ * request will carry, so this reads them and nothing else: there is no
+ * second slicer, no second budget, no second notion of a batch. That is
+ * also why it is strictly stronger than the bootstrap's one-shot guard —
+ * it is asked about the bytes actually going out, once per attempt.
+ *
+ * **EVERY RECORD IS READ, NOT JUST THE HEAD.** `sessionOwnedPrefix`
+ * guarantees one SESSION per slice, and this producer stamps `projectId`
+ * from process-constant configuration, so a mixed slice cannot arise from
+ * our own writer. It can arise from a queue we did not write, and a guard
+ * that trusted the head would pass the whole batch on one agreeing record.
+ * The slice is bounded by `ChunkBounds`, so reading all of it is cheap.
+ *
+ * **MISSING OWNERSHIP IS NOT AUTHORITY TO SEND, AND THE RULE IS
+ * SELF-CALIBRATING RATHER THAN A PRODUCER CONTRACT.** A silent record
+ * among records that DO state a project is anomalous — the producer
+ * demonstrably stamps the field, so this one is unattributable and the
+ * batch is refused. A WHOLLY silent slice is a different fact: this
+ * pipeline is producer-agnostic by design (its own header: it "never sees
+ * sdkFamily, sdkVersion, platform or hostPlatform"), so it cannot know
+ * whether silence is legal for whoever filled this queue, and refusing on
+ * that basis would impose a contract it has no standing to impose.
+ *
+ * That distinction was MEASURED, not chosen for convenience. A first draft
+ * refused every silent slice and **143 of 1653 JVM tests failed** — the
+ * pipeline's own fixtures write `{"sessionId":…,"sequence":…,"sdkFamily":
+ * "tracescout-react-native"}` with no project at all — and the honest
+ * reading of that is not "edit 143 expectations" but "this layer is
+ * exercised, deliberately, with records that make no claim".
+ *
+ * Both SHIPPED producers do stamp it unconditionally, so in production the
+ * anomalous case is the reachable one: `Envelope.envelopeFields` emits
+ * `str("projectId", id.projectId)` on every event (and `str` omits only a
+ * null, over a non-null `String`), and the React Native producer's
+ * `RnEnvelope` sets `fields["projectId"]` the same way.
+ *
+ * RESIDUAL, STATED RATHER THAN HIDDEN: a slice in which NO record
+ * states a project is still posted under the current credential. For both
+ * shipped producers that is unreachable — it requires a queue this SDK did
+ * not write — and such a record is bounded to its own single-record slice
+ * by the slicer's unreadable-head rule, where the server's own rejection
+ * is what disposes of it.
+ *
+ * (The bootstrap's `crossProjectRefusal` is a DIFFERENT decision — "may
+ * this process serve this tenant at all" — taken once before any field is
+ * committed. Silence there is genuinely no evidence either way, and
+ * refusing on it would strand a queue nobody can claim before a real
+ * `start` ever got to deliver it. Two boundaries, two questions; do not
+ * "unify" them.)
+ */
+    private fun sliceProjectRefusal(slice: List<ByteArray>): String? {
+        var stated = 0
+        var silent = 0
+        for (r in slice) {
+            val owner = recordField(r, "projectId").orEmpty()
+            if (owner.isBlank()) {
+                silent++
+                continue
+            }
+            stated++
+            if (owner != projectId) return "slice_project_mismatch"
+        }
+        return if (stated > 0 && silent > 0) "slice_project_partially_stated" else null
+    }
+
     private fun producerField(slice: List<ByteArray>, key: String): String = try {
         org.json.JSONObject(String(slice[0], Charsets.UTF_8)).optString(key).take(64)
     } catch (_: Throwable) { "" }
@@ -2457,6 +3317,59 @@ class DurableUploadPipeline(
 
     @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
     companion object {
+
+        /**
+ * **F-15 — the bounded number of carrier attempts ONE PROCESS may spend
+ * on one session's stranded claim.**
+ *
+ * Three, and the number is the only arbitrary thing in this change, so it
+ * is stated rather than hidden: one attempt can be lost to a transient
+ * socket fault, a second to the retry of it, and a third is the margin
+ * that keeps a two-fault sequence from being mistaken for a permanent
+ * one. Beyond it the session reports `carrier_burst_cooling` —
+ * [Disposition.F15_CHECKPOINT_RETRY_OWED], records retained, no further
+ * request — until [F15_CARRIER_BURST_COOLDOWN_MILLIS] has elapsed, at
+ * which point the burst is forgiven and the next drain may attempt again.
+ *
+ * **PER BURST, NOT PER PROCESS, AND THE RENAME IS THE POINT.** The
+ * predecessor spelled this `…_PER_PROCESS` and meant it: an exhausted
+ * budget answered `retryable = false` for the life of the process, so
+ * three transient faults required a host-app relaunch before recovered
+ * transport could deliver the retained records. A rate limit that never
+ * expires is a ban.
+ */
+        internal const val F15_CARRIER_ATTEMPTS_PER_BURST: Int = 3
+
+        /**
+ * **F-15 — how long an exhausted carrier burst cools before it is
+ * forgiven.**
+ *
+ * Five minutes, and like the burst size the number is arbitrary and so
+ * is stated rather than hidden: long enough that a flapping network or a
+ * proxy outage is not re-probed on every flush, short enough that a user
+ * who regains connectivity does not have to relaunch the app. It is
+ * compared against [monotonicNanos], so it is a real elapsed duration
+ * and not a wall-clock difference.
+ *
+ * NOT A TIMER. Nothing is scheduled and nothing wakes up: this is the
+ * threshold [f15Burst] compares against when the NEXT drain — delivered
+ * by the existing backoff/flush scheduling, unchanged by this slice —
+ * asks the gate. A process that never drains again never retries, which
+ * is correct: there is nothing to deliver into.
+ */
+        internal const val F15_CARRIER_BURST_COOLDOWN_MILLIS: Long = 5L * 60L * 1000L
+
+        /**
+ * **F-15 — carrier attempts ONE DRAIN may make, across all sessions.**
+ *
+ * One. The predecessor's comment asserted this property was already
+ * true; it was, but only because there was a single attempt site that
+ * ran once before the slice loop. Now that a newly selected prefix can
+ * ask with its own real boundary, the property has to be ENFORCED, and
+ * an enforced bound is what keeps the request count per drain
+ * independent of how many sessions the queue happens to hold.
+ */
+        internal const val F15_CARRIER_ATTEMPTS_PER_DRAIN: Int = 1
 
         // The producer-capability code set USED to live here. It moved to
         // the SHARED response policy (`transport/Transport.kt`

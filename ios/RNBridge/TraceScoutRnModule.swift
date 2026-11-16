@@ -367,7 +367,21 @@ final class TraceScoutRnModule: NSObject {
                     nativeSessionId: RnTransport.shared.currentIdentity()?.sessionId)
             },
             // Last: Swift requires call-site order to match the signature.
-            trace: { TraceScoutRnModule.rhTrace($0) })
+            trace: { TraceScoutRnModule.rhTrace($0) },
+            // G2 — THE OWNER'S STORE for the identified user. LAST, because the
+            // initializer declares it last and Swift takes arguments in order.
+            //
+            // ITS ABSENCE WAS THE WHOLE DEFECT. `RnBridge.identify` has
+            // existed since an earlier change and `applyUserId` defaulted to nil, so the
+            // call could only ever answer `.notIntegrated`: documented,
+            // unit-tested, and structurally unreachable from a running app —
+            // the same class as `postureProjection`'s unreachable fields.
+            //
+            // PRESENCE OF THIS CLOSURE IS THE ENABLEMENT, exactly like
+            // `hierarchy`. A host that does not supply it gets `NOT_INTEGRATED`
+            // rather than a silent no-op, so "this app never names users" and
+            // "the SDK dropped the name" stay different answers.
+            applyUserId: { RnTransport.shared.applyUserId($0) })
     }()
 
     private var lastFrameRefusal: String?
@@ -503,6 +517,33 @@ final class TraceScoutRnModule: NSObject {
     func declareNeverRecord(_ routeId: String, never: Bool, resolver: RCTPromiseResolveBlock,
                             rejecter: RCTPromiseRejectBlock) {
         resolver(bridge.declareNeverRecord(routeId: routeId, never: never).rawValue)
+    }
+
+    /// **G2 — NAME THE IDENTIFIED USER. The host-callable half of `identify`.**
+    ///
+    /// THIS IS A SEMANTIC DECLARATION, WHICH IS WHY IT MAY BE ON THIS
+    /// SURFACE. The module's rule is that JS states semantics and never
+    /// producer identity: no call here may set the SDK family, protocol
+    /// version, privacy posture, capture mode, session, project or either
+    /// clock. A user id is the ONE identity fact the SDK cannot establish for
+    /// itself — only the host app's auth system knows who is signed in — so it
+    /// must come from the host, and the native-only rule does not reach it.
+    /// `appIdentifier` is read natively for the opposite reason and stays
+    /// unreachable from here.
+    ///
+    /// `String?`, NOT `String`, AND THAT IS LOAD-BEARING. A JS `null` must
+    /// arrive as nil so `IdentityPolicy` can refuse it as `INVALID_INPUT`;
+    /// typing it non-optional would let the ObjC bridge substitute `""` and the
+    /// blank-is-a-refusal rule would be decided by the bridge instead of by the
+    /// policy both platforms share.
+    ///
+    /// EVERY RULE IS THE BRIDGE'S. No validation, no trimming, no default
+    /// here — the argument is forwarded and the typed outcome returned verbatim,
+    /// so the five outcomes keep one meaning across both platforms.
+    @objc(identify:resolver:rejecter:)
+    func identify(_ userId: String?, resolver: RCTPromiseResolveBlock,
+                  rejecter: RCTPromiseRejectBlock) {
+        resolver(bridge.identify(userId: userId).rawValue)
     }
 
     // ── THE ROUTE-HOST INTEGRATION CONTRACT, EXPOSED TO JS ─────────────────
