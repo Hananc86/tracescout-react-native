@@ -389,6 +389,7 @@ public final class RnTransport {
             // There is no incident-specific store, sequence generator or
             // uploader.
             append: { build in RnTransport.shared.enqueue(build) },
+            appendIdentified: { id, build in RnTransport.shared.enqueue(expected: id, build) },
             requestDrain: { reason in RnTransport.shared.requestDrain(reason: reason) }))
     }
 
@@ -429,7 +430,7 @@ public final class RnTransport {
         // A network event describes a request, not a view tree: there is no
         // captured view to count and nothing to declare never-record about.
         let posture = RnEnvelope.Posture(allowedViewCount: 0, screenNeverRecord: false)
-        let appended = enqueue { assigned in
+        let appended = enqueue(expected: id) { assigned, id in
             Data(RnEnvelope.networkRequest(
                 id: id, eventId: eventId, sequence: assigned,
                 timestampMillis: wall, monotonicNanos: mono,
@@ -651,12 +652,36 @@ public final class RnTransport {
     /// session became publishable.
     @discardableResult
     public func enqueue(_ build: (Int64) -> Data) -> Int64? {
+        enqueueRecord(expected: nil) { assigned, _ in build(assigned) }
+    }
+
+    /// Identity and sequence are selected together. A callback from an old
+    /// session is rejected; identify changes within that session are reflected.
+    public func enqueue(expected: RnEnvelope.Identity,
+                        _ build: (Int64, RnEnvelope.Identity) -> Data) -> Int64? {
+        enqueueRecord(expected: expected) { assigned, current in
+            build(assigned, current!) // non-nil is established below before allocation
+        }
+    }
+
+    private func enqueueRecord(expected: RnEnvelope.Identity?,
+                               _ build: (Int64, RnEnvelope.Identity?) -> Data) -> Int64? {
         lock.lock()
+        let current: RnEnvelope.Identity?
+        if let expected = expected {
+            guard let a = active, a.openerDurable, a.generation == generation,
+                  a.identity.sessionId == expected.sessionId,
+                  a.identity.projectId == expected.projectId else {
+                lock.unlock()
+                return nil
+            }
+            current = a.identity
+        } else { current = nil }
         let assigned = sequence
         sequence += 1
         let s = store
         lock.unlock()
-        let bytes = build(assigned)
+        let bytes = build(assigned, current)
         guard let st = s, st.append(bytes) else {
             RecoveryTrace.shared.log("enqueue_failed", [("seq", String(assigned))])
             return nil

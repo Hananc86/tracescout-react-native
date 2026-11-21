@@ -51,6 +51,8 @@ object WebViewAttachment {
     data class Carrier(
         val segmentId: String,
         val browserPrivacyStatus: String?,
+        /** Local attribution guard; never serialized into the wire carrier. */
+        val nativeSessionId: String? = null,
     )
 
     sealed interface Decision {
@@ -88,14 +90,15 @@ object WebViewAttachment {
         if (liveSessionId == null) return Decision.Refuse(REFUSED_NO_SESSION)
         if (segment.nativeSessionId != liveSessionId) return Decision.Refuse(REFUSED_SESSION_MISMATCH)
         if (segmentBoundElsewhere) return Decision.Refuse(REFUSED_SEGMENT_BOUND)
-        return Decision.Admit(Carrier(segment.segmentId, segment.browserPrivacyStatus))
+        return Decision.Admit(Carrier(segment.segmentId, segment.browserPrivacyStatus, liveSessionId))
     }
 
     // WEAK KEYS — see the class comment. Guarded by `lock`, not
     // `synchronized(this)`: a host may attach from the UI thread while the
     // capture seam reads from the same thread, and the read must be cheap.
     private val lock = Any()
-    private val bound = WeakHashMap<WebView, Carrier>()
+    private data class Binding(val sessionId: String, val carrier: Carrier)
+    private val bound = WeakHashMap<WebView, Binding>()
 
     /**
  * Bind [webView] to [segment] for the rest of this page's life.
@@ -113,10 +116,10 @@ object WebViewAttachment {
         capabilitySupported: Boolean = true,
     ): Decision = synchronized(lock) {
         val boundElsewhere = bound.entries.any { (v, c) ->
-            c.segmentId == segment.segmentId && v !== webView
+            c.carrier.segmentId == segment.segmentId && v !== webView
         }
         val d = decide(capabilitySupported, policy, segment, liveSessionId, boundElsewhere)
-        if (d is Decision.Admit) bound[webView] = d.carrier
+        if (d is Decision.Admit) bound[webView] = Binding(segment.nativeSessionId, d.carrier)
         d
     }
 
@@ -132,9 +135,9 @@ object WebViewAttachment {
  * This is the ONLY read path, and it answers for an attached view only.
  * A null view, an un-attached view and a detached view are one answer.
  */
-    fun carrierFor(webView: WebView?): Carrier? {
+    fun carrierFor(webView: WebView?, liveSessionId: String?): Carrier? {
         val v = webView ?: return null
-        return synchronized(lock) { bound[v] }
+        return synchronized(lock) { bound[v]?.takeIf { it.sessionId == liveSessionId }?.carrier }
     }
 
     /** Host-visible "is anything attached" counter. Never names a view. */

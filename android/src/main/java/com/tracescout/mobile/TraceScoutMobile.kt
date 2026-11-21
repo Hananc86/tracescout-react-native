@@ -184,41 +184,12 @@ object TraceScoutMobile {
  */
     private val sessionEndClaim = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-    /**
- * The ONE lock under which [identity] is REPLACED.
- *
- * IT EXISTS BECAUSE G2 MADE THE IDENTITY MUTABLE MID-SESSION. Until
- * `identify` there was exactly one writer — `start`, behind
- * `started.compareAndSet` — so a `@Volatile` reference was sufficient and
- * no lock was needed. `identify` is a read-modify-write (`copy(userId =
- * …)`), and a read-modify-write on a volatile is not atomic: a `start`
- * racing it could have its brand-new session identity overwritten by a copy
- * of the OLD one, which would resurrect a dead session id on every
- * subsequent envelope.
- *
- * THERE ARE THREE WRITERS, NOT TWO, AND THE THIRD IS WHY THIS KDOC WAS
- * WRONG. `start`, `identify` **and `resetGoverned`** all replace
- * [identity], and `resetGoverned`'s `identity = null` was outside the lock
- * while this paragraph claimed "both writers take it". That is not a
- * documentation slip, it is a reachable race with a public entry point:
- * `resetForTest` is shipped `@JvmStatic`, so a host can call it, and the
- * interleaving is
- *
- * 1. `identify` takes the lock and reads a non-null `live`;
- * 2. `resetGoverned` sets `identity = null` OUTSIDE the lock;
- * 3. `identify` writes `live.copy(userId = …)`.
- *
- * The torn-down identity is live again, `hasActiveSession` reports true,
- * and every later envelope carries the DEAD session id — the exact
- * resurrection the lock was introduced to prevent, arriving by the one
- * writer it did not cover. All three now take it.
- *
- * `start` holds it for one assignment (it builds the value first), so the
- * cost is a single uncontended lock once per session, and nothing inside
- * any of the three critical sections can block: each body does nothing but
- * read or replace [identity], which keeps this a LEAF lock and makes a
- * lock-ordering deadlock unrepresentable.
- */
+    /** Identity publication, event identity/sequence admission, and end claims
+     * share this lock. Slow capture work happens before admission; the current
+     * user is selected when its sequence is allocated. Stale sessions refuse.
+     * Admission can perform durable IO. Callers must not enter this lock while
+     * holding a queue lock that can call back into identity publication.
+     */
     private val identityWriteLock = Any()
     @Volatile private var store: EncryptedEventStore? = null
     /** The queue home the store belongs to — the identity the pipeline is handed (Slice B). */
@@ -558,7 +529,12 @@ object TraceScoutMobile {
                 pixelRatio = metrics.density.toDouble(),
             ),
         )
-        synchronized(identityWriteLock) { identity = newIdentity }
+        synchronized(identityWriteLock) {
+            identity = newIdentity
+            sessionStartedMono = clock.monotonicNanos()
+            sessionEndClaim.set(null)
+            com.tracescout.mobile.capture.WebViewAttachment.detachAll()
+        }
         // The session-end anchor and latch are PER SESSION, seeded in the same
         // band as the interaction route below and for the same reason: a value
         // left over from the previous session is worse than no value. The anchor
@@ -569,8 +545,6 @@ object TraceScoutMobile {
         // again after `resetForTest`/`resetGoverned` AND after a teardown that
         // did not release (`!outcome.released` returns early), so a process that
         // ended one session must be able to end the next.
-        sessionStartedMono = clock.monotonicNanos()
-        sessionEndClaim.set(null)
         // an earlier change: the session's CURRENT screen at start is `initialScreen`, so
         // seed the interaction route with it. `InteractionProducer` refuses a
         // gesture with no route (`no_route` — "without a screen there is no
@@ -702,7 +676,6 @@ object TraceScoutMobile {
         // `started` CAS, so the claim cannot outlive a refused start.
         beginTransportChange(TransportOwner.LIVE)
         appContext = app
-        config = cfg
         home = h
         store = h.store()
         bracket = com.tracescout.mobile.internal.queue.EvictionBracket(
@@ -746,7 +719,9 @@ object TraceScoutMobile {
                     "cleared" to q.cleared, "consumed" to q.consumed)
             is com.tracescout.mobile.internal.queue.QueueReconciler.Outcome.NotNeeded -> Unit
         }
-        uploader = Uploader(cfg.baseUrl, cfg.ingestKey)
+        val liveUploader = Uploader(cfg.baseUrl, cfg.ingestKey)
+        config = cfg
+        uploader = liveUploader
         // The transport group is complete — close it BEFORE the recovery
         // generation, the worker drain and the inherited drain below, so every
         // one of them reads a settled quadruple rather than a publication in
@@ -775,8 +750,8 @@ object TraceScoutMobile {
         // envelopes already carry their own session id, sequence and time.
         recoverInherited(app)
         RecoveryTrace.log("start_continues")
-        enqueueDisclosing { d ->
-            Envelope.sessionStart(identity!!, admit("mobile_session_start"), clock.monotonicNanos(),
+        enqueueDisclosing(identity!!) { id, d ->
+            Envelope.sessionStart(id, admit("mobile_session_start"), clock.monotonicNanos(),
                 posture(), clock = clock, dropped = d)
         }
         sid
@@ -1740,7 +1715,7 @@ object TraceScoutMobile {
                     if (r.claimResolution(p.first)) {
                         val id = identity
                         if (id != null) {
-                            enqueueDisclosing { dd ->
+                            enqueueDisclosing(id) { id, dd ->
                                 Envelope.screenCaptureUnavailable(
                                     id, admit("mobile_screen_snapshot"), clock.monotonicNanos(), posture(),
                                     screenId = p.second,
@@ -1803,7 +1778,7 @@ object TraceScoutMobile {
         // never traversed: it emits ONLY the typed lifecycle marker below, which
         // carries screen identity, timing and posture and no content at all.
         if (com.tracescout.mobile.privacy.ScreenPolicy.isNeverRecord(screenId)) {
-            enqueueDisclosing { d ->
+            enqueueDisclosing(id) { id, d ->
                 Envelope.screenNeverRecord(
                     id, admit("mobile_screen_snapshot"), clock.monotonicNanos(), posture(),
                     screenId = screenId, clock = clock, dropped = d,
@@ -1872,7 +1847,7 @@ object TraceScoutMobile {
         if (outcome.decision == com.tracescout.mobile.capture.CaptureOutcome.Decision.UNAVAILABLE) {
             // Verdict already available at capture time.
             if (attempt == null || reg!!.claimResolution(attempt)) {
-                enqueueDisclosing { d ->
+                enqueueDisclosing(id) { id, d ->
                     Envelope.screenCaptureUnavailable(
                         id, admit("mobile_screen_snapshot"), clock.monotonicNanos(), posture(),
                         screenId = screenId,
@@ -1970,7 +1945,7 @@ object TraceScoutMobile {
             RecoveryTrace.log("privacy_pruned_subtrees",
                 "count" to canonical.prunedCount, "screenId" to screenId)
         }
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.viewHierarchy(
                 id = id,
                 sequence = admit("mobile_view_hierarchy"),
@@ -2127,7 +2102,7 @@ object TraceScoutMobile {
         // byte upload, with the capture-time monotonic clock — exactly the
         // RN producer's order (RnBridge.emitFrameEvent). A frame whose bytes
         // later fail renders as a typed placeholder at its correct time.
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.visualFrame(
                 id, admit("mobile_visual_frame"), captureMono, posture(),
                 screenId = screenId, visualFrameId = frameId,
@@ -2201,7 +2176,7 @@ object TraceScoutMobile {
     @JvmStatic
     fun recordLifecycle(transition: String, appState: String): Boolean = guard("lifecycle") {
         val id = identity ?: return@guard false
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.lifecycle(id, admit("mobile_lifecycle"), clock.monotonicNanos(), posture(),
                 transition, appState, clock = clock, dropped = d)
         }
@@ -2238,7 +2213,7 @@ object TraceScoutMobile {
         // session. The route moves only when the navigation is actually going
         // to be recorded.
         interactionScreen = toScreenId
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.navigation(id, admit("mobile_navigation"), clock.monotonicNanos(), posture(),
                 transition, toScreenId, fromScreenId, toScreenName, deepLinkPathTemplate,
                 clock = clock, dropped = d)
@@ -2249,7 +2224,7 @@ object TraceScoutMobile {
     @JvmStatic
     fun recordHang(durationMs: Long): Boolean = guard("hang") {
         val id = identity ?: return@guard false
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.hang(id, admit("mobile_hang"), clock.monotonicNanos(), posture(),
                 durationMs, clock = clock, dropped = d)
         }
@@ -2386,17 +2361,8 @@ object TraceScoutMobile {
         // loser re-reads, now sees a token naming its own session, and is
         // answered ALREADY_EMITTED.
         //
-        // NO LOCK, DELIBERATELY. The identity read is unsynchronized, so a
-        // teardown and a new `start` can swap the session under it — but with
-        // the session-aware rule the worst that produces is a claim naming a
-        // session that is already over, which the next live call OVERWRITES.
-        // No end is lost and none is duplicated. Taking `identityWriteLock`
-        // here would make the correctness a critical section instead of a
-        // property, and it would add a sixth `synchronized(identityWriteLock)`
-        // that writes no identity — which `IdentifyWiringTest` pins as a
-        // writes-to-locks EQUALITY, deliberately, so that a lock cannot drift
-        // away from the writes it is supposed to cover.
-        //
+        // Claim and live-session validation share the identity publication lock.
+        // A stale reader cannot replace a newer session's completed claim.
         // READ BACK AT THE **LAST** SEPARATOR, AND THAT IS NOT COSMETIC. The
         // token is `<sessionId>#<nonce>`, and `start(…, sessionId = …)` takes the
         // host's string VERBATIM (`val sid = sessionId ?: Ids.newSessionId(clock)`)
@@ -2413,19 +2379,17 @@ object TraceScoutMobile {
         // contain `#`. So this is correct for EVERY session id, not merely for
         // the canonical ones — and on a canonical id (no `#` at all) it is
         // byte-identical to the first-separator read it replaces.
-        val id: Envelope.SessionIdentity
-        val claimToken: String
-        while (true) {
+        val endAdmission = synchronized(identityWriteLock) {
             val live = identity ?: return@guard SessionEndEmission.NO_SESSION
             val held = sessionEndClaim.get()
-            if (held != null && held.substringBeforeLast('#') == live.sessionId) {
+            if (held != null && held.substringBeforeLast('#') == live.sessionId)
                 return@guard SessionEndEmission.ALREADY_EMITTED
-            }
             val token = live.sessionId + "#" + java.util.UUID.randomUUID()
-            if (sessionEndClaim.compareAndSet(held, token)) {
-                id = live; claimToken = token; break
-            }
+            sessionEndClaim.set(token)
+            live to token
         }
+        val id = endAdmission.first
+        val claimToken = endAdmission.second
         // CLAIMED BEFORE ANYTHING IS BUILT, so two threads cannot both pass.
         // It is released again ONLY where nothing was claimed and nothing was
         // stored — see the `claimed < 0` branch below — and then only by a
@@ -2479,7 +2443,7 @@ object TraceScoutMobile {
         // it reaches no builder at all. `claimed` says that; `sequence` claimed
         // something it is not.
         var claimed = -1L
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.sessionEnd(id, admit("mobile_session_end").also { claimed = it },
                 nowMono, posture(),
                 Envelope.SESSION_END_MANUAL, durationMs, clock = clock, dropped = d)
@@ -2525,6 +2489,7 @@ object TraceScoutMobile {
                 // An interaction is never a reason to start a session.
                 captureEnabled = { interactionEnabled && identity != null },
                 sink = { e, carrier -> recordInteraction(e, carrier) },
+                sessionIdProvider = { identity?.sessionId },
             ).also { interactionCapture = it; it.installForApplication(app) }
             activity?.let { c.install(it) }
             true
@@ -2658,7 +2623,7 @@ object TraceScoutMobile {
                             // for anything else, which leaves the row
                             // unattributed rather than claiming "native".
                             val carrier = webView?.let {
-                                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(it)
+                                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(it, identity?.sessionId)
                             }
                             // THE WRITER RETURNS A BARE BOOLEAN, so `false`
                             // means EITHER the session ended between the check
@@ -2907,7 +2872,7 @@ object TraceScoutMobile {
             RecoveryTrace.log("network_request_refused", "why" to why)
             return@guard false
         }
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.networkRequest(id, admit("mobile_network_request"), posture(),
                 facts, screenId, clock = clock, dropped = d)
         }
@@ -2919,9 +2884,9 @@ object TraceScoutMobile {
         webView: com.tracescout.mobile.capture.WebViewAttachment.Carrier? = null,
     ): Boolean = guard("interaction") {
         val id = identity ?: return@guard false
-        enqueueDisclosing { d ->
+        enqueueDisclosing(id) { id, d ->
             Envelope.interaction(id, admit("mobile_interaction"), posture(), e,
-                clock = clock, dropped = d, webView = webView)
+                clock = clock, dropped = d, webView = webView?.takeIf { it.nativeSessionId == id.sessionId })
         }
         true
     } ?: false
@@ -2950,8 +2915,10 @@ object TraceScoutMobile {
         capabilitySupported: Boolean = true,
     ): com.tracescout.mobile.capture.WebViewAttachment.Decision =
         guard("webview") {
-            com.tracescout.mobile.capture.WebViewAttachment.attach(
-                webView, segment, policy, identity?.sessionId, capabilitySupported)
+            synchronized(identityWriteLock) {
+                com.tracescout.mobile.capture.WebViewAttachment.attach(
+                    webView, segment, policy, identity?.sessionId, capabilitySupported)
+            }
         } ?: com.tracescout.mobile.capture.WebViewAttachment.Decision
             .Refuse(com.tracescout.mobile.capture.WebViewAttachment.REFUSED_NO_SESSION)
 
@@ -3622,10 +3589,15 @@ object TraceScoutMobile {
  * - Rule 1 still excludes crash-thread state effects, which is why `crash`
  * is outside this helper at all.
  */
-    private inline fun enqueueDisclosing(build: (Map<String, Int>) -> Envelope.Record) {
+    // Select the current user and assign the sequence within the same owner lock
+    // as identify. A slow producer from a replaced session is refused, not relabelled.
+    private inline fun enqueueDisclosing(expected: Envelope.SessionIdentity,
+        build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record) = synchronized(identityWriteLock) {
+        val live = identity ?: return@synchronized
+        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized
         val d = takePreF6Dropped()
         val rec = try {
-            build(d)
+            build(live, d)
         } catch (t: Throwable) {
             returnPreF6DroppedMap(d)
             throw t
@@ -4147,27 +4119,24 @@ object TraceScoutMobile {
             //
             // READ AT CRASH TIME, NOT AT INSTALL TIME — see the comment on
             // the precondition above. `identity` is `@Volatile`, so this is a
-            // plain volatile read: cheap, and safe on the dying thread. A
+            // read paired with sequence admission under the owner lock. A
             // missing session THROWS, which is the convention this very block
             // already relies on for a refused claim: `CrashHandler` wraps
             // `recordBuilder` in its Rule-1 catch and chains the host handler
             // regardless, so an SDK fault can never swallow the host's crash.
-            val id = identity ?: throw IllegalStateException("crash_no_session")
-            Envelope.crash(
-                id = id,
-                // F2: claimed durably even at crash time — the record exists
-                // to be delivered on the next launch, so its number must be
-                // owned across the death. A refused claim THROWS: CrashHandler
-                // catches, chains the host handler, and nothing is appended
-                // with a number nobody owns (traced first, so the next launch
-                // can read why).
-                sequence = admit("mobile_crash").also { q ->
+            val admission = synchronized(identityWriteLock) {
+                val live = identity ?: throw IllegalStateException("crash_no_session")
+                live to admit("mobile_crash").also { q ->
                     if (q < 0) {
                         RecoveryTrace.log("crash_admission_refused")
                         throw IllegalStateException("crash_admission_refused")
                     }
                     crashTicketSequence = q
-                },
+                }
+            }
+            Envelope.crash(
+                id = admission.first,
+                sequence = admission.second,
                 monotonicNanos = clock.monotonicNanos(),
                 posture = posture(),
                 // The CLASS of crash, through the twin pinned to the shared
@@ -4527,8 +4496,12 @@ object TraceScoutMobile {
         // had just cleared; see the [identityWriteLock] KDoc for the exact
         // interleaving. The critical section is this one assignment, so the
         // leaf-lock property that makes a deadlock unrepresentable holds.
-        synchronized(identityWriteLock) { identity = null }
-        com.tracescout.mobile.capture.WebViewAttachment.detachAll()
+        synchronized(identityWriteLock) {
+            identity = null
+            sessionStartedMono = null
+            sessionEndClaim.set(null)
+            com.tracescout.mobile.capture.WebViewAttachment.detachAll()
+        }
         // EVERY opt-in consent switch is released here, and the test below
         // derives that set from THIS block rather than naming one. The network
         // switch was missed when it was added: `interactionEnabled` was reset
@@ -4542,7 +4515,6 @@ object TraceScoutMobile {
         // `…Enabled = false` shape and these two deliberately do not take it —
         // but leaving them set would charge the NEXT session's duration to a
         // dead anchor and would let a session that never ended look ended.
-        sessionStartedMono = null; sessionEndClaim.set(null)
         interactionScreen = null; interactionEnabled = false
         // The SAME rule as the two above, for the same reason: a permission
         // must never outlive the session it was granted for.

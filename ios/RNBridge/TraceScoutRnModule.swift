@@ -390,6 +390,10 @@ final class TraceScoutRnModule: NSObject {
         func enqueue(_ build: (Int64) -> Data) -> Int64? {
             RnTransport.shared.enqueue(build)
         }
+        func enqueue(expected: RnEnvelope.Identity,
+                     _ build: (Int64, RnEnvelope.Identity) -> Data) -> Int64? {
+            RnTransport.shared.enqueue(expected: expected, build)
+        }
         func flushHint(_ reason: String) { RnTransport.shared.requestDrain(reason: reason) }
         func stateName() -> String { RnTransport.shared.state().rawValue }
         func currentGeneration() -> UInt64 { RnTransport.shared.currentGeneration() }

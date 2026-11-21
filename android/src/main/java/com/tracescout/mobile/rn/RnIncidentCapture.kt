@@ -232,11 +232,6 @@ object RnIncidentCapture {
         // its SETTLEMENT already lived — `RnTransport` — because they are one
         // fact and were split across two files. This producer asks for a ticket
         // and never reaches the authority itself.
-        val ticket = RnTransport.beginIncidentAdmission(app, id.sessionId, "mobile_crash")
-            ?: throw IllegalStateException("rn_crash_admission_unavailable")
-        crashTicket = ticket
-        crashTicketSequence.set(ticket.sequence)
-
         val raw = throwable.stackTrace
         val plan = IncidentPolicy.framePlan(raw.size)
         if (plan.dropped > 0) {
@@ -262,13 +257,19 @@ object RnIncidentCapture {
             )
         }
         val eventId = newEventId()
+        val eventPosture = ctx2.posture()
+        val eventScreen = ctx2.screenId()
+        val ticket = RnTransport.beginIncidentAdmission(app, id.sessionId, "mobile_crash")
+            ?: throw IllegalStateException("rn_crash_admission_unavailable")
+        crashTicket = ticket
+        crashTicketSequence.set(ticket.sequence)
         return RnEnvelope.crash(
             id = id,
             eventId = eventId,
             sequence = ticket.sequence,
             timestampMillis = System.currentTimeMillis(),
             monotonicNanos = System.nanoTime(),
-            posture = ctx2.posture(),
+            posture = eventPosture,
             // The event's own id IS the incident identity, as on the native
             // producer: one crash, one record, one `UNIQUE (session_row_id,
             // error_id)` row, and a retried upload upserts rather than
@@ -279,7 +280,7 @@ object RnIncidentCapture {
             threadName = thread.name,
             isMainThread = thread === Looper.getMainLooper().thread,
             frames = frames,
-            screenId = ctx2.screenId(),
+            screenId = eventScreen,
         ).toByteArray(Charsets.UTF_8)
     }
 

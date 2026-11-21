@@ -43,6 +43,7 @@ class InteractionCapture(
     private val sink: (InteractionProducer.Emission, com.tracescout.mobile.capture.WebViewAttachment.Carrier?) -> Unit,
     private val clockNanos: () -> Long = System::nanoTime,
     private val wallMillis: () -> Long = System::currentTimeMillis,
+    private val sessionIdProvider: () -> String? = { null },
 ) {
 
     /** Counters for a host-visible "why did nothing record". Never logs content. */
@@ -55,6 +56,7 @@ class InteractionCapture(
     // holds the wrapper strongly for as long as the Activity lives.
     private val installed = WeakHashMap<Activity, java.lang.ref.WeakReference<ObservingWindowCallback>>()
     private val lifecycles = WeakHashMap<Activity, GestureLifecycle>()
+    private val gestureSessions = WeakHashMap<Activity, String?>()
 
     /**
  * The carrier chosen at this gesture's DOWN, held for every phase of it.
@@ -95,6 +97,7 @@ class InteractionCapture(
     fun uninstall(activity: Activity) {
         lifecycles.remove(activity)
         gestureCarrier.remove(activity)
+        gestureSessions.remove(activity)
         val ours = installed.remove(activity)?.get() ?: return
         // Observation stops even when a later wrapper keeps us in its chain;
         // delegation to the host stays unconditional.
@@ -184,9 +187,17 @@ class InteractionCapture(
         )
         // Gated at the hit-test fact of the gesture's DOWN, then HELD. The
         // registry is never asked for a gesture that began outside web content.
+        val session = sessionIdProvider()
+        if (action != GestureLifecycle.Action.DOWN && gestureSessions[activity] != session) {
+            lifecycles[activity]?.reset()
+            gestureCarrier.remove(activity)
+            gestureSessions.remove(activity)
+            return
+        }
         if (action == GestureLifecycle.Action.DOWN) {
+            gestureSessions[activity] = session
             gestureCarrier[activity] = carrierFor(target.webView != null) {
-                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(target.webView)
+                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(target.webView, session)
             }()
         }
         val carrier = gestureCarrier[activity]

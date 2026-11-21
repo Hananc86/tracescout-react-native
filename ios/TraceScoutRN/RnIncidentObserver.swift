@@ -92,17 +92,20 @@ public enum RnIncidentObserver {
         public let append: (@escaping (Int64) -> Data) -> Int64?
         /// Ask for a drain. A hang is observed in a LIVE process, so unlike a
         /// crash it does not have to wait for the next launch.
+        public let appendIdentified: (RnEnvelope.Identity, @escaping (Int64, RnEnvelope.Identity) -> Data) -> Int64?
         public let requestDrain: (String) -> Void
 
         public init(identity: @escaping () -> RnEnvelope.Identity?,
                     posture: @escaping () -> RnEnvelope.Posture,
                     screenId: @escaping () -> String?,
                     append: @escaping (@escaping (Int64) -> Data) -> Int64?,
+                    appendIdentified: ((RnEnvelope.Identity, @escaping (Int64, RnEnvelope.Identity) -> Data) -> Int64?)? = nil,
                     requestDrain: @escaping (String) -> Void) {
             self.identity = identity
             self.posture = posture
             self.screenId = screenId
             self.append = append
+            self.appendIdentified = appendIdentified ?? { id, build in append { build($0, id) } }
             self.requestDrain = requestDrain
         }
     }
@@ -232,7 +235,7 @@ public enum RnIncidentObserver {
         // is exactly the rule the Android native producer states and this
         // programme inherits.
         let typeName = exception.name.rawValue
-        let appended = ctx.append { assigned in
+        let appended = ctx.appendIdentified(id) { assigned, id in
             Data(RnEnvelope.crash(
                 id: id, eventId: eventId, sequence: assigned,
                 timestampMillis: wall, monotonicNanos: mono, posture: posture,
@@ -333,7 +336,7 @@ public enum RnIncidentObserver {
         let mono = Int64(DispatchTime.now().uptimeNanoseconds)
         let posture = ctx.posture()
         let screen = ctx.screenId()
-        _ = ctx.append { assigned in
+        _ = ctx.appendIdentified(id) { assigned, id in
             Data(RnEnvelope.hang(
                 id: id, eventId: eventId, sequence: assigned,
                 timestampMillis: wall, monotonicNanos: mono, posture: posture,

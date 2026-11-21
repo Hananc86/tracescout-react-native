@@ -551,9 +551,9 @@ class DurableUploadPipeline(
  */
     private sealed class F15Gate {
         /**
- * Deliver. Either the authority holds no claim, or it holds one whose
- * boundary is NOT strictly below this batch — which is not the F-15
- * shape and is the ordinary matching-boundary case.
+ * Deliver when no claim blocks the selected body. A larger frozen claim
+ * is omitted from a smaller event-only body; it is not declared aligned
+ * or settled. The unsized screen cannot decide this omission yet.
  */
         object Clear : F15Gate()
 
@@ -639,6 +639,9 @@ class DurableUploadPipeline(
                 // right-hand side, so nothing can be shown aligned.
                 boundary is F15Boundary.Last && boundary.value < 0L ->
                     F15Gate.Unresolved("batch_last_unreadable", retryable = true)
+                // A smaller event-only delivery may proceed without
+                // this incompatible block. The durable claim stays immutable.
+                boundary is F15Boundary.Last && claim.throughSequence > boundary.value -> F15Gate.Clear
                 f15Aligned(claim.throughSequence, batchFirst, boundary) -> F15Gate.Clear
                 else -> f15Stranded(session)
             }
@@ -1172,7 +1175,8 @@ class DurableUploadPipeline(
         // the whole chunk and the crash inside it. Refusing here RETAINS the
         // records instead of destroying them; nothing is posted, dequeued,
         // parked, quarantined or removed, and the claim is left exactly as it is.
-        if (resume == null) {
+        if (resume == null && !sessionAlreadyTerminal(
+                rest.firstOrNull()?.let { LossAuthority.RecordFields.parse(it)?.sessionId } ?: fallbackSessionId)) {
             val g = reconcileStrandedPendingCheckpoint(rest)
             if (g is F15Gate.Unresolved) {
                 val hf = rest.firstOrNull()?.let { LossAuthority.RecordFields.parse(it) }
@@ -1257,6 +1261,38 @@ class DurableUploadPipeline(
             // to ATTEMPT: a mixed-case claim the screen waved through would
             // otherwise be refused here on every drain for ever, with no request
             // ever made to settle it — retention without recovery.
+            // ZERO HTTP FOR A SESSION ALREADY PROVEN TERMINAL. The device
+            // learned this fact once, durably; a later slice of the same dead
+            // session must not re-ask a server that can only say no again. The
+            // `firstSequence > 0` clause still applies inside the policy, so a
+            // slice that carries the opener is never archived by this path.
+            if (sessionAlreadyTerminal(batchSession)) {
+                val v = SessionOriginPolicy.verdict(
+                    SessionOriginPolicy.Evidence(
+                        sessionPreconditionRefusal = false,
+                        firstSequence = batch.firstSequence.toLongOrNull() ?: -1L,
+                        openerPresentInActiveStore = false,
+                        openerRecoverableElsewhere = false,
+                        sessionAlreadyTerminal = true))
+                if (v == SessionOriginPolicy.Verdict.TERMINAL_SESSION_ORIGIN) {
+                    RecoveryTrace.log(
+                        "terminal_known_no_post",
+                        "session" to batchSession, "chunk" to batch.chunkId.take(12),
+                        "recordCount" to n)
+                    if (moveTerminal(n, batch, slice, pending)) {
+                        inflight.clear()
+                        rest = rest.subList(n, rest.size)
+                        results.last = null
+                        disposition = if (rest.isEmpty()) Disposition.EMPTY
+                                      else Disposition.TERMINAL_MOVED_AND_MORE_REMAIN
+                        resume = null
+                        continue@slices
+                    }
+                    disposition = terminalPendingOrBlocked()
+                    return
+                }
+            }
+
             if (pending == null) {
                 val bFirst = batch.firstSequence.toLongOrNull() ?: -1L
                 val bLast = batch.lastSequence.toLongOrNull() ?: -1L
@@ -1293,38 +1329,6 @@ class DurableUploadPipeline(
                 }
                 if (g is F15Gate.Unresolved) {
                     f15Refuse(batchSession, bFirst, g)
-                    return
-                }
-            }
-
-            // ZERO HTTP FOR A SESSION ALREADY PROVEN TERMINAL. The device
-            // learned this fact once, durably; a later slice of the same dead
-            // session must not re-ask a server that can only say no again. The
-            // `firstSequence > 0` clause still applies inside the policy, so a
-            // slice that carries the opener is never archived by this path.
-            if (sessionAlreadyTerminal(batchSession)) {
-                val v = SessionOriginPolicy.verdict(
-                    SessionOriginPolicy.Evidence(
-                        sessionPreconditionRefusal = false,
-                        firstSequence = batch.firstSequence.toLongOrNull() ?: -1L,
-                        openerPresentInActiveStore = false,
-                        openerRecoverableElsewhere = false,
-                        sessionAlreadyTerminal = true))
-                if (v == SessionOriginPolicy.Verdict.TERMINAL_SESSION_ORIGIN) {
-                    RecoveryTrace.log(
-                        "terminal_known_no_post",
-                        "session" to batchSession, "chunk" to batch.chunkId.take(12),
-                        "recordCount" to n)
-                    if (moveTerminal(n, batch, slice, pending)) {
-                        inflight.clear()
-                        rest = rest.subList(n, rest.size)
-                        results.last = null
-                        disposition = if (rest.isEmpty()) Disposition.EMPTY
-                                      else Disposition.TERMINAL_MOVED_AND_MORE_REMAIN
-                        resume = null
-                        continue@slices
-                    }
-                    disposition = terminalPendingOrBlocked()
                     return
                 }
             }
@@ -1387,7 +1391,22 @@ class DurableUploadPipeline(
             // must rebuild BYTE-IDENTICAL bytes or the pipeline stops. On the
             // first attempt the claim is persisted; a retry finds that durable
             // row and re-derives the SAME five-key document from it by value.
-            val f6Checkpoint = attribution.f6CheckpointJson(
+            val emissionClaim = try { attribution.f7PendingClaim(batchSession) }
+                catch (t: Throwable) {
+                    if (t is SimulatedProcessDeath) throw t
+                    AttributionSink.PendingClaim.Unreadable(t.javaClass.simpleName)
+                }
+            if (emissionClaim is AttributionSink.PendingClaim.Unreadable) {
+                f15Refuse(batchSession, batch.firstSequence.toLongOrNull() ?: -1L,
+                    F15Gate.Unresolved("authority_unreadable", retryable = true))
+                return
+            }
+            // Ordinary event-only envelopes already permit a null checkpoint.
+            // Do not ask F6 for fresh arithmetic or mutate a frozen larger claim.
+            // On resume the digest below still demands exactly the original body.
+            val omitLargerPending = emissionClaim is AttributionSink.PendingClaim.Pending &&
+                emissionClaim.throughSequence > (batch.lastSequence.toLongOrNull() ?: -1L)
+            val f6Checkpoint = if (omitLargerPending) null else attribution.f6CheckpointJson(
                 batchSession,
                 batch.firstSequence.toLongOrNull() ?: -1L,
                 batch.lastSequence.toLongOrNull() ?: -1L,
@@ -2642,7 +2661,7 @@ class DurableUploadPipeline(
  * Called ONLY when a loss block was parsed — see the call site. The caller-side
  * guard is the one and only trigger.
  */
-    private fun settleLossCheckpoint(session: String, loss: Uploader.LossAck) {
+    private fun settleLossCheckpoint(session: String, loss: Uploader.LossAck): AttributionSink.Settlement? {
         val s: AttributionSink.Settlement = try {
             attribution.settleLossCheckpoint(
                 session, loss.protocol, loss.lossAccountingVersion, loss.state, loss.sessionId,
@@ -2652,7 +2671,7 @@ class DurableUploadPipeline(
             if (t is SimulatedProcessDeath) throw t
             RecoveryTrace.log("loss_checkpoint_settlement_failed", "code" to t.javaClass.simpleName,
                 "session" to session.take(24))
-            return
+            return null
         }
         val reason = when (s) {
             is AttributionSink.Settlement.PolicyDeclined -> s.reason
@@ -2662,6 +2681,7 @@ class DurableUploadPipeline(
         }
         RecoveryTrace.log("loss_checkpoint_settlement", "outcome" to s.javaClass.simpleName,
             "state" to loss.state, "reason" to reason.take(40), "session" to session.take(24))
+        return s
     }
 
     // ───────────────────────── F7 SLICE A: the metadata-only emission ──────
@@ -2677,7 +2697,7 @@ class DurableUploadPipeline(
         /** The emitter declined (no authority, disabled, nothing to advance, …). */
         internal object NotEmitted : MetadataOnly()
         /** Posted, and the server's `loss-checkpoint-ack-1` was routed for settlement. */
-        internal data class Acknowledged(val state: String) : MetadataOnly()
+        internal data class Acknowledged(val state: String, val settlement: AttributionSink.Settlement?) : MetadataOnly()
         /** Posted; the response carried NO parseable loss block, so nothing settled. */
         internal data class Unacknowledged(val status: Int, val code: String?) : MetadataOnly()
         /** The request could not be made at all. */
@@ -2771,6 +2791,20 @@ class DurableUploadPipeline(
         transportEvent: String,
         unackEvent: String,
     ): MetadataOnly {
+        // A later session in the queue is not vouched for by the bootstrap's
+        // first-prefix check. Read ownership before constructing any carrier bytes.
+        val records = try { store.readRecords() } catch (t: Throwable) {
+            if (t is SimulatedProcessDeath) throw t
+            return MetadataOnly.NotSent("carrier_ownership_unreadable")
+        }
+        if (try { !store.readIsComplete() } catch (t: Throwable) {
+                if (t is SimulatedProcessDeath) throw t
+                true
+            })
+            return MetadataOnly.NotSent("carrier_ownership_unreadable")
+        val owned = records.filter { recordField(it, "sessionId") == sessionId }
+        if (sliceProjectRefusal(owned) != null)
+            return MetadataOnly.NotSent("carrier_project_mismatch")
         // The ONE body encoder, with an EMPTY slice: `"events":[]`.
         val body = encodeBody(sessionId, doc.chunkId, emptyList(), doc.json)
         RecoveryTrace.log(
@@ -2791,8 +2825,8 @@ class DurableUploadPipeline(
             RecoveryTrace.log(unackEvent, "status" to r.status, "code" to (r.code ?: ""))
             return MetadataOnly.Unacknowledged(r.status, r.code)
         }
-        settleLossCheckpoint(sessionId, loss)
-        return MetadataOnly.Acknowledged(loss.state)
+        val settlement = settleLossCheckpoint(sessionId, loss)
+        return MetadataOnly.Acknowledged(loss.state, settlement)
     }
 
     /**
@@ -2984,13 +3018,11 @@ class DurableUploadPipeline(
         }
         val settled = after is AttributionSink.PendingClaim.None
         if (!settled && after !is AttributionSink.PendingClaim.Unreadable &&
-            outcome is MetadataOnly.Acknowledged
+            outcome is MetadataOnly.Acknowledged &&
+            outcome.settlement is AttributionSink.Settlement.PolicyDeclined
         ) {
-            // The server ANSWERED with a loss block and the claim PROVABLY
-            // survived it, so this carrier cannot settle it. Latch, so one
-            // process makes one attempt — and only on this definite answer,
-            // never on a transport fault, an unacknowledged response, or a
-            // post-settlement read we could not perform.
+            // Only a binder policy decline is definitive. A failed durable
+            // write, refused write or exception must leave the carrier retryable.
             f15Declined.add(session)
         }
         // A NAMED LOCAL, for the same reason as `batchFirst`: the trace value

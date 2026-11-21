@@ -130,8 +130,11 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
         internal fun undeliveredRecordBytes(filesDir: File): Long =
             RECORD_QUEUES.sumOf { name ->
                 try {
-                    File(filesDir, name).let { if (it.isFile) it.length() else 0L }
-                } catch (_: Throwable) { 1L }
+                    val attributes = java.nio.file.Files.readAttributes(
+                        File(filesDir, name).toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+                    if (attributes.isRegularFile) attributes.size() else 1L
+                } catch (_: java.nio.file.NoSuchFileException) { 0L }
+                  catch (_: Throwable) { 1L }
             }
 
         /**
@@ -221,7 +224,12 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
             if (pending <= 0L) return null
             val ok = try { boot(ctx) } catch (_: Throwable) { false }
             RecoveryTrace.log("worker_bootstrap", "ok" to ok, "pending_bytes" to pending)
-            return if (ok) drainHook else null
+            val drain = if (ok) drainHook else null
+            return drain?.let { installed -> { context ->
+                val outcome = installed(context)
+                if (outcome == Outcome.DONE && undeliveredRecordBytes(context.filesDir) > 0L)
+                    Outcome.RETRY else outcome
+            } }
         }
 
         /** Enqueue the ONE drain job. Idempotent by construction. */

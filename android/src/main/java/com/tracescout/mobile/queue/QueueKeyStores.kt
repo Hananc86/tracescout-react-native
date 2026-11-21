@@ -338,7 +338,7 @@ object QueueKeyStores {
             return FrameSweep(emptyList(), emptyList(), "not_a_directory")
         }
         val canonicalParent = try { filesDir.canonicalFile } catch (_: Throwable) { null }
-        if (canonicalParent == null || canonicalRoot.parentFile != canonicalParent) {
+        if (canonicalParent == null || canonicalRoot != File(canonicalParent, dirName)) {
             return FrameSweep(emptyList(), emptyList(), "directory_escapes_root")
         }
         val entries = root.listFiles()

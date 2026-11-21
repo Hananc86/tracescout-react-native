@@ -53,6 +53,8 @@ public final class RnBridge {
         ///
         /// Returns NIL when the record did not reach the durable queue.
         func enqueue(_ build: (Int64) -> Data) -> Int64?
+        func enqueue(expected: RnEnvelope.Identity,
+                     _ build: (Int64, RnEnvelope.Identity) -> Data) -> Int64?
         func flushHint(_ reason: String)
         func stateName() -> String
         /// The durable generation a record is being written under. A reset
@@ -1489,7 +1491,7 @@ public final class RnBridge {
         let wall = clock.wallMillis(), mono = clock.monotonicNanos()
         let eventId = ids.newEventId()
         let posture = RnEnvelope.Posture(allowedViewCount: 0, screenNeverRecord: false)
-        _ = sink.enqueue { assigned in
+        _ = sink.enqueue(expected: id) { assigned, id in
             Data(RnEnvelope.visualFrame(
                 id: id, eventId: eventId, sequence: assigned, timestampMillis: wall,
                 monotonicNanos: mono, posture: posture, visualFrameId: fr.visualFrameId,
@@ -1525,7 +1527,7 @@ public final class RnBridge {
             snapshotId: snapshotId, screenId: routeId,
             result: capture.result, captureDurationMs: capture.durationMs, webView: wv)
         guard probe.utf8.count <= 65_536 - 512 else { return snap }
-        _ = sink.enqueue { assigned in
+        _ = sink.enqueue(expected: id) { assigned, id in
             Data(RnEnvelope.viewHierarchy(
                 id: id, eventId: eventId, sequence: assigned,
                 timestampMillis: wall, monotonicNanos: mono, posture: posture,
@@ -1671,16 +1673,30 @@ public final class RnBridge {
         // read below is still the only place an event asks for its carrier.
         let webViewRef = carrier
         let wv = webViewRef?()
-        guard let seq = sink.enqueue({ assigned in
-            Data(RnEnvelope.envelope(id: id, eventId: eventId, eventType: eventType,
+        let build: (Int64, RnEnvelope.Identity) -> Data = { assigned, current in
+            Data(RnEnvelope.envelope(id: current, eventId: eventId, eventType: eventType,
                                      sequence: assigned, timestampMillis: wall,
                                      monotonicNanos: mono, posture: posture,
                                      extra: body, webView: wv).utf8)
-        }) else {
+        }
+        // A session opener must be durable before its identity can be active.
+        let assigned = eventType == "mobile_session_start"
+            ? sink.enqueue { build($0, id) }
+            : sink.enqueue(expected: id, build)
+        guard let seq = assigned else {
             // Not durable, therefore not recorded. Saying RECORDED here would
             // be the same class of lie as publishing a session with no opener.
             return Result(.notConfigured)
         }
         return Result(.recorded, sequence: seq)
+    }
+}
+
+// Compatibility for sinks with no mutable identity owner. Production TransportSink
+// overrides this overload to bind identity and sequence in one critical section.
+public extension RnBridge.DurableSink {
+    func enqueue(expected: RnEnvelope.Identity,
+                 _ build: (Int64, RnEnvelope.Identity) -> Data) -> Int64? {
+        enqueue { build($0, expected) }
     }
 }
