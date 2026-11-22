@@ -358,6 +358,41 @@ class Pr3PipelineRegressionTest {
         }
     }
 
+    @Test fun emptyQueueCheckpointFailuresKeepOnlyTransientRetriesOwed() {
+        for (mode in listOf("transport", "503", "429", "missingAck", "refused", "accepted")) {
+            val f = tmp(); val h = strand(f, 0, 6, 6); val q = queue(f)
+            assertTrue(realSink(f).projectOwnership(sid, "p", true))
+            val frozen = snapshot(h.pendingCheckpoint())
+            val bodies = ArrayList<String>()
+            val p = pipeline(f, q, bodies) {
+                when (mode) {
+                    "transport" -> throw java.io.IOException("offline")
+                    "503" -> Uploader.Result(ResponseAction.RETRY, 503, "temporary")
+                    "429" -> Uploader.Result(ResponseAction.RETRY, 429, "rate_limited")
+                    "missingAck" -> ok(null)
+                    "refused" -> Uploader.Result(ResponseAction.TERMINAL, 422, "declined")
+                    else -> ok(lossBlock(6, counts()))
+                }
+            }
+            p.upload(emptyList(), sid)
+            assertEquals(mode, 1, bodies.size)
+            assertTrue(mode, isCarrier(bodies.single()))
+            assertEquals(mode, 0, q.readAll().records.size)
+            val retry = mode !in listOf("refused", "accepted")
+            assertEquals(mode, if (retry) DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED
+                else DurableUploadPipeline.Disposition.EMPTY, p.disposition)
+            val classify = com.tracescout.mobile.rn.RnTransport::class.java.getDeclaredMethod(
+                "classify", Uploader.Result::class.java, DurableUploadPipeline.Disposition::class.java
+            ).apply { isAccessible = true }
+            val state = classify.invoke(com.tracescout.mobile.rn.RnTransport, null, p.disposition)
+            assertEquals(mode, if (retry) com.tracescout.mobile.rn.RnTransport.State.PENDING_NETWORK
+                else com.tracescout.mobile.rn.RnTransport.State.READY, state)
+            if (mode == "accepted") assertNull(h.pendingCheckpoint())
+            else assertEquals(mode, frozen, snapshot(h.pendingCheckpoint()))
+            LossAuthority.closeAll(); QueueHome.forgetForTest(); F6CheckpointEmitter.resetForTest()
+        }
+    }
+
     @Test fun emptyQueueWithoutProjectEvidenceCannotDiscloseInheritedAuthority() {
         val f=tmp();strand(f,0,6,6);val q=queue(f);val bodies=ArrayList<String>()
         pipeline(f,q,bodies){error("unproven inherited project reached HTTP")}.upload(emptyList(),sid)

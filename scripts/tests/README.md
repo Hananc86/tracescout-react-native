@@ -29,6 +29,13 @@ refused. It is not a server-acceptance proof.
 and requires a truthful `no_session` refusal. The extracted Kotlin probe also
 checks same-session identify/sequence ordering; its mutation control must fail.
 
+An empty record queue with a transient pending-checkpoint carrier failure retains
+its frozen claim and reports retry owed; RN maps that result to the existing worker
+retry state even though no record response exists. The regression covers transport
+exceptions, HTTP 503/429, a success without a loss ACK, a definite 422 refusal and
+genuine settlement. It proves the pipeline and state mapping, not Android worker
+execution on a device.
+
 An inherited session with no authority on disk is adopted and bound before its
 first POST (`inheritedSessionWithoutAuthorityBindsBeforePostAndDelivers` checks the
 binding file exists when the request is made). A binding refusal sends nothing and

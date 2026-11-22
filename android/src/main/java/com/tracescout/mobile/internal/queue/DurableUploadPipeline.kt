@@ -1010,10 +1010,22 @@ class DurableUploadPipeline(
             // process happens to hold — a process that died holds nothing.
             for (s in chunklessFinalityCandidates(fallbackSessionId)) {
                 val retry = attribution.f7PendingCheckpointRetry(s)
-                if (retry != null) postCarrierDocument(s, retry,
+                val outcome = if (retry != null) postCarrierDocument(s, retry,
                     "f7_metadata_only_request", "f7_metadata_only_retry",
                     "f7_metadata_only_transport_failed", "f7_metadata_only_unacknowledged")
                 else finalizeChunklessSession(s)
+                // The record queue is empty, but a transient carrier failure
+                // still owes the worker a retry. Never overwrite an earlier
+                // candidate's obligation with a later successful/refused one.
+                val retryOwed = when (outcome) {
+                    is MetadataOnly.NotSent -> outcome.code !in setOf(
+                        "carrier_project_unproven", "carrier_project_mismatch")
+                    is MetadataOnly.Unacknowledged -> outcome.action != ResponseAction.TERMINAL
+                    is MetadataOnly.Acknowledged -> outcome.settlement is AttributionSink.Settlement.NotDurable ||
+                        outcome.settlement is AttributionSink.Settlement.Refused
+                    is MetadataOnly.NotEmitted -> false
+                }
+                if (retryOwed) disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
             }
             return
         }
@@ -2769,7 +2781,9 @@ class DurableUploadPipeline(
         /** Posted, and the server's `loss-checkpoint-ack-1` was routed for settlement. */
         internal data class Acknowledged(val state: String, val settlement: AttributionSink.Settlement?) : MetadataOnly()
         /** Posted; the response carried NO parseable loss block, so nothing settled. */
-        internal data class Unacknowledged(val status: Int, val code: String?) : MetadataOnly()
+        internal data class Unacknowledged(
+            val status: Int, val code: String?, val action: ResponseAction,
+        ) : MetadataOnly()
         /** The request could not be made at all. */
         internal data class NotSent(val code: String) : MetadataOnly()
     }
@@ -2896,7 +2910,7 @@ class DurableUploadPipeline(
         val loss = r.lossAck
         if (loss == null) {
             RecoveryTrace.log(unackEvent, "status" to r.status, "code" to (r.code ?: ""))
-            return MetadataOnly.Unacknowledged(r.status, r.code)
+            return MetadataOnly.Unacknowledged(r.status, r.code, r.action)
         }
         val settlement = settleLossCheckpoint(sessionId, loss)
         return MetadataOnly.Acknowledged(loss.state, settlement)

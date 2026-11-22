@@ -801,7 +801,7 @@ object RnTransport {
             // from the record sink BEFORE the frame phase runs. The frame
             // drain below cannot change it, and classifying afterwards would
             // only make that dependency look real.
-            val state = classify(sink.last)
+            val state = classify(sink.last, pipeline.disposition)
             // Phase 2: frame BYTES drain after the metadata records, through
             // the same credential, into the existing frame endpoint. The
             // metadata event can precede its bytes (server marks the frame
@@ -1003,19 +1003,25 @@ object RnTransport {
  * or a corrected key drains the same records. Returning READY here would
  * make an app that can never upload look healthy.
  */
-    private fun classify(r: Uploader.Result?): State = when (r?.code) {
-        // Parked and unparkable are the SAME fact for the host: a producer
-        // -capability refusal that no retry can clear. They differ only in
-        // whether the bytes moved out of the active queue, which is an
-        // internal durability detail, not a state the app should branch on.
-        "producer_unsupported", "producer_parked" -> State.PRODUCER_UNSUPPORTED
-        "auth_rejected" -> State.AUTH_REJECTED
-        "session_precondition_missing" -> State.SESSION_PRECONDITION
-        // F4-P0 Slice D: the pipeline's two pre-request refusals of its own.
-        "bracket_unresolved", "bracket_marker_unreadable" -> State.STORAGE_RECOVERY_BLOCKED
-        "erasure_requested" -> State.ERASURE_PENDING
-        null -> State.READY
-        else -> State.PENDING_NETWORK
+    private fun classify(r: Uploader.Result?, disposition: DurableUploadPipeline.Disposition): State {
+        // Empty record queues have no record result. Preserve the carrier's
+        // actual retry obligation so the worker cannot mistake null for DONE.
+        if (r == null && disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED)
+            return State.PENDING_NETWORK
+        return when (r?.code) {
+            // Parked and unparkable are the SAME fact for the host: a producer
+            // -capability refusal that no retry can clear. They differ only in
+            // whether the bytes moved out of the active queue, which is an
+            // internal durability detail, not a state the app should branch on.
+            "producer_unsupported", "producer_parked" -> State.PRODUCER_UNSUPPORTED
+            "auth_rejected" -> State.AUTH_REJECTED
+            "session_precondition_missing" -> State.SESSION_PRECONDITION
+            // F4-P0 Slice D: the pipeline's two pre-request refusals of its own.
+            "bracket_unresolved", "bracket_marker_unreadable" -> State.STORAGE_RECOVERY_BLOCKED
+            "erasure_requested" -> State.ERASURE_PENDING
+            null -> State.READY
+            else -> State.PENDING_NETWORK
+        }
     }
 
     /** The ONE durable in-flight descriptor file — the pipeline's and the reconciler's are the same store. */
