@@ -190,7 +190,7 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
             val drain = drainHook ?: bootstrapThenHook(ctx) ?: run {
                 val bytes = try { undeliveredRecordBytes(ctx.filesDir) } catch (_: Throwable) { 1L }
                 RecoveryTrace.log("worker_no_hook", "pending_bytes" to bytes)
-                return if (bytes > 0L) Outcome.RETRY else Outcome.DONE
+                return if (bytes > 0L || com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)) Outcome.RETRY else Outcome.DONE
             }
             return try { drain(ctx) } catch (_: Throwable) { Outcome.RETRY }
         }
@@ -221,7 +221,7 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
         private fun bootstrapThenHook(ctx: Context): ((Context) -> Outcome)? {
             val boot = bootstrapHook ?: return null
             val pending = try { undeliveredRecordBytes(ctx.filesDir) } catch (_: Throwable) { 1L }
-            if (pending <= 0L) return null
+            if (pending <= 0L && !com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)) return null
             val ok = try { boot(ctx) } catch (_: Throwable) { false }
             RecoveryTrace.log("worker_bootstrap", "ok" to ok, "pending_bytes" to pending)
             val drain = if (ok) drainHook else null

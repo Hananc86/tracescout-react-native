@@ -804,7 +804,8 @@ object TraceScoutMobile {
                     // drain is the one moment no chunk can carry a disclosure,
                     // and the pipeline owns that decision.
                     reachedPipeline = uploadRaw(recs)
-                    if (recs.isEmpty()) 0
+                    if (!reachedPipeline || lastPipelineDisposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) -1
+                    else if (recs.isEmpty()) 0
                     else store?.readAll().let { r ->
                         if (r == null || r.couldNotBeRead) -1 else r.records.size
                     }
@@ -1274,9 +1275,11 @@ object TraceScoutMobile {
                     // a host that declared the session over and was then killed
                     // emits the checkpoint on the next launch. Asked while this
                     // process still holds the recovery lease.
-                    uploadRaw(records)
-                    // Never leave a drain scheduled for an empty queue.
-                    RecoveryWorker.cancel(app)
+                    val reached = uploadRaw(records)
+                    if (!reached || lastPipelineDisposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) {
+                        RecoveryCoordinator.status = RecoveryCoordinator.Status.RECOVERY_RETRIABLE_FAILURE
+                        RecoveryWorker.enqueue(app)
+                    } else RecoveryWorker.cancel(app)
                     // RELEASE ON THIS PATH TOO. The non-empty path hands the lease
                     // to the worker task (released in its finally); this early
                     // return used to keep it, so a start that found nothing to
@@ -2389,65 +2392,17 @@ object TraceScoutMobile {
         }
         val id = endAdmission.first
         val claimToken = endAdmission.second
-        // CLAIMED BEFORE ANYTHING IS BUILT, so two threads cannot both pass.
-        // It is released again ONLY where nothing was claimed and nothing was
-        // stored — see the `claimed < 0` branch below — and then only by a
-        // compare-and-set from THIS call's own token, so a refused admission can
-        // never cancel another session's claim (see [sessionEndClaim]). A
-        // refused APPEND keeps the claim: the authority allocated a sequence and
-        // settles it as LOST(APPEND_REFUSED), so the loss is accounted, and
-        // re-emitting would give one session two closing instants.
-        // READ ONCE, and omitted when the anchor is unknown. `max(0, …)` is
-        // belt-and-braces for a monotonic clock that is specified not to go
-        // backwards: the schema's `minimum: 0` would refuse a negative, and a
-        // refused event is worse than an unmeasured duration.
+        // Claim before building, but release if no append task was scheduled.
+        // A scheduled append owns the closing event even if it later settles lost.
         val startedMono = sessionStartedMono
         val nowMono = clock.monotonicNanos()
         val durationMs = startedMono?.let { maxOf(0L, (nowMono - it) / 1_000_000L) }
-        // THE ADMISSION'S ANSWER IS READ, NOT DISCARDED — and discarding it
-        // was a REAL SILENT LOSS, found in review. `admit` returns -1 when the
-        // authority is missing, the queue is recovery-blocked or a reconciliation
-        // fact binds the image; `Envelope.sessionEnd` accepts that sequence
-        // happily and `enqueue` then drops the record at its own
-        // `rec.sequence < 0` guard (`enqueue_unnumbered_dropped`) and returns
-        // normally. The first version therefore answered EMITTED with nothing
-        // stored AND the latch consumed, so the host could never retry: the
-        // session end was lost permanently and the caller was told it succeeded.
-        // That is the F-6/F-42 loss class reached through the ADMISSION instead
-        // of through a read, and the KDoc's "handed to the durable append path"
-        // was true of the call while being false about the outcome.
-        //
-        // THE RELEASE IS NARROW ON PURPOSE. `enqueue` takes its
-        // `rec.sequence < 0` exit BEFORE it touches `pending` or the store, so
-        // in exactly this case we KNOW nothing was claimed and nothing was
-        // written — a retry is safe and is what the host wants once the block
-        // clears. Every other failure keeps the latch, because we cannot prove
-        // the record did not reach the store and a duplicate end rewrites the
-        // first. See [SessionEndEmission.REFUSED].
-        // `admit(.)` STAYS INSIDE THE BUILDER CALL, and `.also` is what keeps
-        // it there. `AuthorityOwnershipPinsTest` pairs each `admit("T")` with the
-        // `Envelope.<fn>(` that LEXICALLY encloses it, by scanning backwards for
-        // the nearest builder call — so hoisting the admission onto its own line
-        // made that pin resolve the WRONG builder and fail, on a change that
-        // preserved the property it checks. Re-pointing an accepted pin because
-        // a new change moved its anchor is the larger intervention (the `enqueue`
-        // KDoc makes the same call for the same reason), so the fix keeps the
-        // lexical shape and captures the answer beside it.
-        // NAMED `claimed`, NOT `sequence`, AND THAT IS NOT COSMETIC. The same
-        // pin's last assertion forbids any `sequence = <non-admit>` reaching an
-        // Envelope builder — its proxy for "a producer grew a local sequence
-        // counter" — and `sequence = it` inside the capture matched it. This
-        // value is not a sequence source: it is the ADMISSION'S ANSWER, read
-        // AFTER the builder has already been handed `admit(.)` directly, and
-        // it reaches no builder at all. `claimed` says that; `sequence` claimed
-        // something it is not.
-        var claimed = -1L
-        enqueueDisclosing(id) { id, d ->
-            Envelope.sessionEnd(id, admit("mobile_session_end").also { claimed = it },
+        val admission = enqueueDisclosing(id) { id, d ->
+            Envelope.sessionEnd(id, admit("mobile_session_end"),
                 nowMono, posture(),
                 Envelope.SESSION_END_MANUAL, durationMs, clock = clock, dropped = d)
         }
-        if (claimed < 0) {
+        if (admission != EnqueueAdmission.SUBMITTED) {
             // COMPARE-AND-SET FROM THIS CALL'S TOKEN, never an unconditional
             // clear: between the claim above and this line a teardown and a new
             // `start` may have installed another session whose end is already
@@ -3150,7 +3105,10 @@ object TraceScoutMobile {
         try { openParkStore().status() }
         catch (_: Throwable) { com.tracescout.mobile.internal.queue.ParkStatus(0, 0, 0L) }
 
+    @Volatile private var lastPipelineDisposition = DurableUploadPipeline.Disposition.EMPTY
+
     private fun uploadRaw(records: List<ByteArray>): Boolean {
+        lastPipelineDisposition = DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
         // OPEN OF THE TRANSPORT SEQLOCK — see [transportEpoch]. The four
         // fields below are independent, so reading them one at a time can
         // compose half of one entry point's transport with half of another's.
@@ -3226,7 +3184,7 @@ object TraceScoutMobile {
         // React Native producer reuses this implementation rather than copying
         // it; the pipeline is producer-agnostic and never sees sdkFamily,
         // sdkVersion, platform or hostPlatform.
-        DurableUploadPipeline(
+        val pipeline = DurableUploadPipeline(
             // The QUEUE HOME, never a bare store (Slice B, B4): the pipeline's
             // check-then-mutate sequences run as regions on the home's locks.
             home = h,
@@ -3276,7 +3234,9 @@ object TraceScoutMobile {
             attribution = com.tracescout.mobile.internal.queue.AttributionSink.forFilesDir(app.filesDir),
             // F4-P2: a drain that meets a LOSSY image reconciles it first (F4-16).
             reconciler = com.tracescout.mobile.internal.queue.QueueReconciler(h, app.filesDir, inflightStoreOf(app)),
-        ).upload(records, fallbackSessionId)
+        )
+        pipeline.upload(records, fallbackSessionId)
+        lastPipelineDisposition = pipeline.disposition
         return true
     }
 

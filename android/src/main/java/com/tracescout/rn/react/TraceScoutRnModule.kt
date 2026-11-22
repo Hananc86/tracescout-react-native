@@ -96,6 +96,7 @@ class TraceScoutRnModule(
 
     private fun buildBridge() = RnBridge(
         identity = { session },
+        identityAdmissionLock = identityLock,
         beginSession = { beginIdentity(reactContext.applicationContext) },
         configured = {
             com.tracescout.mobile.rn.RnSecureConfig
@@ -286,8 +287,20 @@ class TraceScoutRnModule(
     // place that named the methods gained it in a legible diff, and the one
     // place that carried only a number went stale with nothing to point at.
 
-    @ReactMethod fun startSession(initialRouteId: String?, promise: Promise) =
-        promise.resolve(bridge.startSession(initialRouteId).outcome.name)
+    @ReactMethod fun startSession(initialRouteId: String?, promise: Promise) {
+        val result = bridge.startSession(initialRouteId)
+        if (result.outcome == RnBridge.Outcome.RECORDED) {
+            com.tracescout.mobile.rn.RnIncidentCapture.install(reactContext.applicationContext,
+                object : com.tracescout.mobile.rn.RnIncidentCapture.Context2 {
+                    override val identityLock get() = this@TraceScoutRnModule.identityLock
+                    override fun identity() = session
+                    override fun posture() = RnEnvelope.Posture(allowedViewCount = 0,
+                        screenNeverRecord = bridge.currentRouteId() == null)
+                    override fun screenId() = bridge.currentRouteId()
+                })
+        }
+        promise.resolve(result.outcome.name)
+    }
 
     @ReactMethod fun navigate(
         fromRouteId: String?,

@@ -161,11 +161,16 @@ needed_swift = sorted(set(re.findall(
 check('F0', bool(needed_kt) and bool(needed_swift),
       f'the enablement derivation is non-vacuous: kotlin {needed_kt}, swift {needed_swift}')
 
-# Kotlin supplies a named argument `x = ...`; Swift supplies `x: ...`.
+# Require a non-null argument, ignoring comments and literal contents. A name
+# followed by '=' alone also accepts the disabled value null/nil.
+def code_only(source):
+    return re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+                  lambda m: '""' if m.group().startswith('"') else ' ', source, flags=re.S)
+
 missing_kt = [d for d in needed_kt
-              if not re.search(r'\b' + re.escape(d) + r'\s*=', src_kt)]
+              if not re.search(r'\b' + re.escape(d) + r'\s*=\s*(?!null\b)(?=[{A-Za-z_])', code_only(src_kt))]
 missing_swift = [d for d in needed_swift
-                 if not re.search(r'\b' + re.escape(d) + r'\s*:', read(SWIFT_MODULE))]
+                 if not re.search(r'\b' + re.escape(d) + r'\s*:\s*(?!nil\b)(?=[{A-Za-z_])', code_only(read(SWIFT_MODULE)))]
 check('F1', not missing_kt,
       f'the Android module supplies every dependency whose absence is '
       f'NOT_INTEGRATED; missing: {missing_kt or "none"}')

@@ -87,3 +87,27 @@ The package job uses the committed npm lock and `npm ci --legacy-peer-deps
 React Native 0.88.1 is a pinned development dependency for its real type declarations; no React Native application is launched. The Swift job uses the Linux
 Swift 6.0.3 image and the portable probe above; it proves transport interleavings,
 not Apple SDK compilation, CocoaPods integration, rendering or device execution.
+
+## Backup-review corrections (T-2120)
+
+The bridge regression pauses an event before admission, then identifies another
+user or replaces its session. Sequence admission must use the current user and
+refuse a replaced session. The native session-end regression refuses an append
+that never schedules and verifies a retry can still take the end claim.
+
+Checkpoint tests reconstruct pipelines between retries, enforce the three-attempt
+process-local cooldown, bootstrap an otherwise empty worker from a durable claim,
+and call both the configured RN drain and native worker against a synthetic
+loopback HTTP 503 endpoint. The RN test leaves finalizedSession absent. These
+execute the real pipeline with encrypted authority/queue files; the RN configuration
+is supplied at its native configuration boundary to avoid Android Keystore in a
+host JVM. No React or device runtime is asserted. A foreign-project prefix test
+uses an in-memory park sink to prove preservation precedes current-project delivery.
+Production parking continues through the existing encrypted park store.
+
+`pr3-privacy-probe.py` compiles the actual target resolver and interaction policy
+against deterministic Android view doubles. It tests elevated/reordered overlaps,
+disjoint views and hidden overlays. `--control` restores the former reverse-index
+selection and requires the specific coordinate-leak assertion to fail after
+successful compilation. The Swift portable probe also executes the actual backtrace
+parser with an unsymbolicated address and a named symbol.

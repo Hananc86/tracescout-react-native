@@ -61,6 +61,9 @@ class Pr3InteractionAdmissionTest {
             fields.getValue("interactionScreen").set(TraceScoutMobile,"screen")
             fields.getValue("authority").set(TraceScoutMobile,h)
             fields.getValue("config").set(TraceScoutMobile,null)
+            assertEquals(TraceScoutMobile.SessionEndEmission.REFUSED, TraceScoutMobile.recordSessionEnd())
+            assertEquals("a refused append must release its end claim", TraceScoutMobile.SessionEndEmission.REFUSED,
+                TraceScoutMobile.recordSessionEnd())
             val before=h.unsettledSequences().size
             assertEquals(HostInteraction.Decision.Refused(HostInteraction.REFUSED_INTERNAL_ERROR),
                 TraceScoutMobile.recordHostInteraction("tap"))

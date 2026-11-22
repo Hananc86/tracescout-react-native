@@ -88,7 +88,13 @@ object InteractionTargetResolver {
             var next: View? = null
             for (i in g.childCount - 1 downTo 0) {
                 val c = g.getChildAt(i)
-                if (c.visibility == View.VISIBLE && contains(c, x, y)) { next = c; break }
+                if (c.visibility == View.VISIBLE && contains(c, x, y)) {
+                    // Child index is not drawing/touch order (elevation and
+                    // custom drawing order can disagree). Ambiguous overlaps
+                    // cannot authorize coordinates from an underlying view.
+                    if (next != null) return Target(TargetClass.UNKNOWN, PositionTreatment.BLOCKED, true)
+                    next = c
+                }
             }
             if (next == null) break
             if (view is WebView) break     // web content is S5's lane, never descended

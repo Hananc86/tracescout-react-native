@@ -104,6 +104,7 @@ object RnIncidentCapture {
  * invented identity would destroy the record it was trying to save.
  */
     interface Context2 {
+        val identityLock: Any get() = this
         /** The live RN session, or null if none is running. */
         fun identity(): RnEnvelope.Identity?
 
@@ -222,7 +223,7 @@ object RnIncidentCapture {
         ctx2: Context2,
         thread: Thread,
         throwable: Throwable,
-    ): ByteArray {
+    ): ByteArray = synchronized(ctx2.identityLock) {
         val id = ctx2.identity()
             ?: throw IllegalStateException("rn_crash_no_session")
         // THE CLAIM IS THE TRANSPORT'S, AND A MODULE-BOUNDARY GUARD IS WHY.
@@ -322,7 +323,7 @@ object RnIncidentCapture {
         blockedMs: Long,
         stack: Array<StackTraceElement>,
         thresholdMs: Long,
-    ) {
+    ): Unit = synchronized(ctx2.identityLock) {
         // The policy decides whether this is emittable at all — a non-finite or
         // non-positive duration is refused there, because the server reads
         // `blockedMs` with no range and a hang lane that can show a negative
@@ -369,12 +370,8 @@ object RnIncidentCapture {
                 hangKind = IncidentPolicy.hangKindFor("android"),
                 blockedMs = blockedMs,
                 thresholdMs = thresholdMs,
-                // OBSERVED, NOT INFERRED. The watchdog is still running, so
-                // the block has demonstrably been survived. Whether the process
-                // is killed LATER is not knowable here, and a producer that
-                // guessed `false` would be reporting a process death that has
-                // not happened.
-                recovered = true,
+                // The threshold was observed while the main thread was stalled.
+                recovered = false,
                 frames = frames,
                 screenId = screen,
             ).toByteArray(Charsets.UTF_8)

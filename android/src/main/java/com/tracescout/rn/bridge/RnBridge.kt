@@ -152,6 +152,7 @@ class RnBridge(
  * ([Outcome.NOT_INTEGRATED]) instead of quietly doing nothing.
  */
     private val applyUserId: ((String) -> Boolean)? = null,
+    private val identityAdmissionLock: Any = Any(),
 ) {
 
     /** An already-redacted, encoded frame the native layer produced. */
@@ -411,7 +412,7 @@ class RnBridge(
             return Outcome.INVALID_INPUT
         }
         val applied = try {
-            apply(accepted)
+            synchronized(identityAdmissionLock) { apply(accepted) }
         } catch (_: Throwable) {
             // The owner is documented never to throw; if it does, the host app
             // still must not. A failure to apply is never a silent RECORDED.
@@ -1084,9 +1085,9 @@ class RnBridge(
         val wall = clock.wallMillis(); val mono = clock.monotonicNanos()
         val eventId = ids.newEventId()
         val posture = RnEnvelope.Posture(allowedViewCount = 0, screenNeverRecord = false)
-        sink.enqueue { assigned ->
+        enqueueCurrent(id) { current, assigned ->
             RnEnvelope.visualFrame(
-                id, eventId, assigned, wall, mono, posture, fr.visualFrameId, routeId,
+                current, eventId, assigned, wall, mono, posture, fr.visualFrameId, routeId,
                 fr.contentHash, fr.width, fr.height, fr.byteSize, fr.format, fr.quality, fr.downscale,
             ).toByteArray(Charsets.UTF_8)
         }
@@ -1128,9 +1129,9 @@ class RnBridge(
             capture.result, capture.durationMs, wv,
         )
         if (probe.toByteArray(Charsets.UTF_8).size > 65_536 - 512) return snap
-        sink.enqueue { assigned ->
+        enqueueCurrent(id) { current, assigned ->
             RnEnvelope.viewHierarchy(
-                id, eventId, assigned, wall, mono, posture, snapshotId, routeId,
+                current, eventId, assigned, wall, mono, posture, snapshotId, routeId,
                 capture.result, capture.durationMs, wv,
             ).toByteArray(Charsets.UTF_8)
         }
@@ -1272,6 +1273,14 @@ class RnBridge(
     /** Diagnostics/tests: the last observed web-content fact for a route. */
     fun observedScreenHoldsWebContent(routeId: String): Boolean? = screenWebContent[routeId]
 
+    private fun enqueueCurrent(expected: RnEnvelope.Identity, build: (RnEnvelope.Identity, Long) -> ByteArray): Long =
+        synchronized(identityAdmissionLock) {
+            val current = identity() ?: return@synchronized -1L
+            if (current.sessionId != expected.sessionId || current.projectId != expected.projectId)
+                return@synchronized -1L
+            sink.enqueue { sequence -> build(current, sequence) }
+        }
+
     private fun emitWith(
         id: RnEnvelope.Identity,
         eventType: String,
@@ -1298,9 +1307,9 @@ class RnBridge(
         // session's carrier by default.
         val webViewRef = webView
         val wv = webViewRef?.invoke()
-        val seq = sink.enqueue { assigned ->
+        val seq = enqueueCurrent(id) { current, assigned ->
             RnEnvelope.envelope(
-                id = id,
+                id = current,
                 eventId = eventId,
                 eventType = eventType,
                 // The assigned value, not a local counter. This is the whole

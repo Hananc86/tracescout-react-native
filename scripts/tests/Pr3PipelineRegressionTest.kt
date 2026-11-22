@@ -192,6 +192,125 @@ class Pr3PipelineRegressionTest {
     )
 
 
+    @Test fun foreignPrefixIsPreservedBeforeCurrentProjectDrains() {
+        val f=tmp();val h=strand(f,0,0,0);val frozen=snapshot(h.pendingCheckpoint())
+        val q=queue(f);val foreign=String(rec(0)).replace("{","{\"projectId\":\"foreign\",").toByteArray()
+        val current=String(rec(0,other)).replace("{","{\"projectId\":\"p\",").toByteArray()
+        q.append(foreign);q.append(current)
+        val kept=ArrayList<ByteArray>();val entries=ArrayList<ParkedBatch>()
+        val park=object:ParkStore {
+            override fun entriesRead()=ParkManifestRead(entries.toList(),RecordStore.INTEGRITY_OK)
+            override fun park(batch:ParkedBatch,records:List<ByteArray>):ParkOutcome {
+                entries.add(batch);kept.addAll(records.map{it.copyOf()});return ParkOutcome.PARKED
+            }
+            override fun status()=ParkStatus(entries.size,kept.size,kept.sumOf{it.size.toLong()})
+        }
+        val bodies=ArrayList<String>()
+        pipelineWith(f,q,bodies,realSink(f),park=park){chunkOk(it)}.upload(q.readAll().records,sid)
+        assertEquals(1,kept.size);assertTrue(foreign.contentEquals(kept.single()))
+        assertEquals(1,bodies.size);assertTrue(bodies.single().contains(other))
+        assertFalse(bodies.single().contains("foreign"));assertTrue(q.readAll().records.isEmpty())
+        assertEquals("slice_project_mismatch",entries.single().refusalCode)
+        assertEquals("parking must not rewrite a frozen claim",frozen,snapshot(h.pendingCheckpoint()))
+    }
+
+    @Test fun freshPipelinesShareCarrierCooldown() {
+        val f=tmp();strand(f,0,6,8);val q=queue(f);q.append(rec(7));q.append(rec(8))
+        val bodies=ArrayList<String>();val mono=Mono()
+        repeat(4){ pipelineWith(f,q,bodies,realSink(f),mono=mono){Uploader.Result(ResponseAction.RETRY,503,"busy")}.upload(q.readAll().records,sid) }
+        assertEquals(3,bodies.size)
+        mono.advanceMillis(300001)
+        pipelineWith(f,q,bodies,realSink(f),mono=mono){Uploader.Result(ResponseAction.RETRY,503,"busy")}.upload(q.readAll().records,sid)
+        assertEquals(4,bodies.size);assertNotNull(authority(f).pendingCheckpoint())
+    }
+
+    @Test fun rnDrainDiscoversCheckpointWithoutFinalizedSession() = checkpointOnlyDrain(false)
+    @Test fun nativeWorkerRetainsCheckpointOnlyRetry() = checkpointOnlyDrain(true)
+
+    private fun checkpointOnlyDrain(native:Boolean) {
+        val f=tmp();val h=strand(f,0,6,8)
+        assertTrue(realSink(f).projectOwnership(sid,"p",true))
+        val q=EncryptedEventStore(File(f,if(native) com.tracescout.mobile.queue.QueueKeyStores.SDK_QUEUE else com.tracescout.mobile.queue.QueueKeyStores.RN_QUEUE),k,
+            4L*1024*1024,EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,yes)
+        QueueHome.of(q.backingFile()){q}
+        val transport:Any=if(native) com.tracescout.mobile.TraceScoutMobile else com.tracescout.mobile.rn.RnTransport
+        fun field(name:String)=transport.javaClass.getDeclaredField(name).apply{isAccessible=true}
+        val fields=(if(native) listOf("store","config","home","uploader","appContext","identity","lastPipelineDisposition")
+            else listOf("store","finalizedSession","lastPipelineDisposition")).associateWith{field(it)}
+        val priorHook=com.tracescout.mobile.queue.RecoveryWorker.drainHook
+        val prior=fields.mapValues{it.value.get(transport)}
+        val context=object:android.content.ContextWrapper(null) {
+            override fun getFilesDir()=f
+            override fun getApplicationContext():android.content.Context=this
+        }
+        val posts=java.util.concurrent.atomic.AtomicInteger()
+        val server=java.net.ServerSocket(0,1,java.net.InetAddress.getByName("127.0.0.1"))
+        server.soTimeout=5000
+        val serverError=java.util.concurrent.atomic.AtomicReference<Throwable>()
+        val serving=Thread {
+            try { server.accept().use { client ->
+                client.soTimeout=5000
+                val input=client.getInputStream()
+                val header=StringBuilder()
+                while(!header.endsWith("\r\n\r\n")) {val c=input.read();check(c>=0);header.append(c.toChar())}
+                val length=Regex("(?i)Content-Length: ([0-9]+)").find(header)!!.groupValues[1].toInt()
+                repeat(length){check(input.read()>=0)}
+                posts.incrementAndGet()
+                client.getOutputStream().apply {
+                    write("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".toByteArray());flush()
+                }
+            } } catch(t:Throwable){serverError.set(t)}
+        }
+        serving.start()
+        try {
+            fields.getValue("store").set(transport,q)
+            val url="http://127.0.0.1:${server.localPort}"
+            if(native) {
+                fields.getValue("config").set(transport,com.tracescout.mobile.TraceScoutMobile.Config("p","synthetic-test-key",url))
+                fields.getValue("home").set(transport,QueueHome.of(q.backingFile()){q})
+                fields.getValue("uploader").set(transport,Uploader(url,"synthetic-test-key"))
+                fields.getValue("appContext").set(transport,context)
+                fields.getValue("identity").set(transport,null)
+                transport.javaClass.getDeclaredMethod("installWorkerDrain").apply{isAccessible=true}.invoke(transport)
+                assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,
+                    com.tracescout.mobile.queue.RecoveryWorker.drainHook!!(context))
+            } else {
+                fields.getValue("finalizedSession").set(transport,null)
+                val cfg=com.tracescout.mobile.rn.RnSecureConfig.Config("p","synthetic-test-key","test",url)
+                assertEquals(com.tracescout.mobile.rn.RnTransport.State.PENDING_NETWORK,
+                    com.tracescout.mobile.rn.RnTransport.drainConfigured(context,cfg))
+            }
+            serving.join(6000);assertNull(serverError.get());assertEquals(1,posts.get());assertNotNull(h.pendingCheckpoint());assertTrue(q.readAll().records.isEmpty())
+        } finally {
+            server.close();serving.join(6000);fields.forEach{(name,field)->field.set(transport,prior[name])}
+            com.tracescout.mobile.queue.RecoveryCoordinator.release(context)
+            com.tracescout.mobile.queue.RecoveryWorker.drainHook=priorHook
+        }
+    }
+
+    @Test fun workerBootstrapsCheckpointOnlyWork() {
+        val f=tmp(); val h=strand(f,0,6,8)
+        assertTrue(LossAuthority.hasPendingRecovery(f))
+        val broken=tmp();val brokenRoot=EncryptedAuthorityStore.rootFor(broken).toPath()
+        java.nio.file.Files.createSymbolicLink(brokenRoot,brokenRoot)
+        assertTrue("unreadable authority root is not empty",LossAuthority.hasPendingRecovery(broken))
+        val worker=com.tracescout.mobile.queue.RecoveryWorker
+        val oldDrain=worker.drainHook; val oldBoot=worker.bootstrapHook
+        val context=object:android.content.ContextWrapper(null) {
+            override fun getFilesDir()=f
+        }
+        var boots=0; var drains=0
+        try {
+            worker.drainHook=null
+            worker.bootstrapHook={ boots++; worker.drainHook={ drains++; com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY }; true }
+            assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY, worker.outcomeFor(context))
+            assertEquals(1,boots);assertEquals(1,drains)
+            worker.drainHook=null;worker.bootstrapHook=null
+            assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,worker.outcomeFor(context))
+            assertNotNull(h.pendingCheckpoint())
+        } finally {worker.drainHook=oldDrain;worker.bootstrapHook=oldBoot}
+    }
+
     @Test fun transientSettlementFailuresRemainRetryable() {
         for (mode in listOf("notDurable", "refused", "throw", "declined")) {
             val f=tmp();strand(f,0,6,8);val q=queue(f)
@@ -206,7 +325,8 @@ class Pr3PipelineRegressionTest {
                 }
             }
             val p=pipelineWith(f,q,bodies,sink){ok(lossBlock(6,counts()))}
-            p.upload(q.readAll().records,sid);p.upload(q.readAll().records,sid)
+            p.upload(q.readAll().records,sid)
+            pipelineWith(f,q,bodies,sink){ok(lossBlock(6,counts()))}.upload(q.readAll().records,sid)
             assertEquals(mode,if(mode=="declined") 1 else 2,bodies.size)
             assertTrue(bodies.all{isCarrier(it)})
             assertEquals(2,q.readAll().records.size)

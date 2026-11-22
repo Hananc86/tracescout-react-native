@@ -44,7 +44,10 @@ jobs:
           gradle -p scripts/ci/android :tracescout:testDebugUnitTest probeCompiler --no-daemon --console=plain 2>&1 | tee ci-results/android.log
           python3 scripts/ci/check-junit.py | tee ci-results/junit-counts.txt
       - name: Kotlin identity and admission controls
-        run: python3 scripts/ci/kotlin-controls.py
+        run: |
+          python3 scripts/ci/kotlin-controls.py
+          python3 scripts/tests/pr3-privacy-probe.py
+          python3 scripts/tests/pr3-privacy-probe.py --control
       - uses: actions/upload-artifact@v4
         if: always()
         with:

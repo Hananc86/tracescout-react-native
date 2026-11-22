@@ -24,7 +24,7 @@ if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected,
 end=block(s,'val endAdmission = synchronized(identityWriteLock)').replace('return@guard','return')
 q=read('queue/QueueKeyStores.kt');sweep=block(q,'fun clearOwnedFrameFiles(')
 w=read('queue/RecoveryWorker.kt');metadata=w[w.index('internal fun undeliveredRecordBytes'):w.index('\n        /**',w.index('internal fun undeliveredRecordBytes'))]
-bootstrap=block(w,'private fun bootstrapThenHook').replace('private fun','fun')
+bootstrap=block(w,'private fun bootstrapThenHook').replace('private fun','fun').replace('com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)', 'false /* checkpoint-only bootstrap is exercised by the real JVM worker test */')
 program='''import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch

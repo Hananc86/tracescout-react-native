@@ -606,8 +606,10 @@ object RnTransport {
  * lease nobody can release silently disables recovery for the whole
  * staleness window — the failure it exists to prevent.
  */
-    private fun drainOnce(ctx: Context): State {
-        val cfg = RnSecureConfig.load(ctx) ?: return State.NOT_CONFIGURED
+    private fun drainOnce(ctx: Context): State = drainConfigured(ctx, RnSecureConfig.load(ctx))
+
+    internal fun drainConfigured(ctx: Context, cfg: RnSecureConfig.Config?): State {
+        if (cfg == null) return State.NOT_CONFIGURED
         val s = store ?: return State.NOT_CONFIGURED
         if (!RecoveryCoordinator.acquire(ctx)) {
             // **NOT `lastState` — THAT IS THE F-42 DEFECT.** Returning the
@@ -707,30 +709,10 @@ object RnTransport {
                 }
                 is QueueRead.Readable -> read.records
             }
-            // **THE EMPTY BRANCH IS NO LONGER A DEAD END WHEN A SESSION HAS
-            // BEEN DECLARED OVER.** This `return` is exactly the reason
-            // the R-2 chunkless finality checkpoint could not be produced by
-            // this producer: `DurableUploadPipeline` owns the trigger, and no
-            // RN drain ever reached it with an empty queue. The native producer
-            // closed the same gap by routing its three empty drains through the
-            // unchanged `uploadRaw`; this is the one RN site of that shape.
-            //
-            // SCOPED TO THE CASE THAT CAN PRODUCE SOMETHING. An ordinary
-            // empty drain — no session declared over — still returns here, with
-            // the same trace and the same state, so the overwhelmingly common
-            // path is byte-unchanged and a drain never builds a pipeline for a
-            // queue that has nothing to say.
-            //
-            // THE POINTER IS NOT CLEARED, deliberately. The ONCE guarantee
-            // lives in the core (a settled terminal boundary refuses a second
-            // claim) and the gate re-reads the DURABLE ledger on every pass, so
-            // re-asking is safe; clearing on the first attempt would discard
-            // the only pointer this process has if that attempt met no network.
+            // Empty records still reach the pipeline: pending checkpoints can
+            // survive both the last event ACK and a process restart. The pipeline
+            // discovers inherited authorities without a process-local pointer.
             val finalizing = if (records.isEmpty()) finalizedSession else null
-            if (records.isEmpty() && finalizing == null) {
-                RecoveryTrace.log("rn_queue_empty")
-                return State.READY
-            }
             // an earlier change: an EMPTY read is this drain's final look at the store, so
             // the tail stays OPEN for it — including the finalizing case, which
             // removes nothing and appends nothing.

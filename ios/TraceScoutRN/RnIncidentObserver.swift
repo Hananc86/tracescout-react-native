@@ -343,12 +343,8 @@ public enum RnIncidentObserver {
                 errorId: eventId,
                 hangKind: IncidentPolicy.hangKindFor("ios"),
                 blockedMs: blockedMs, thresholdMs: thresholdMs,
-                // OBSERVED, NOT INFERRED. The watchdog is still running, so
-                // the block has demonstrably been survived. Whether the process
-                // is killed LATER is not knowable here, and a producer that
-                // guessed `false` would be reporting a process death that has
-                // not happened.
-                recovered: true,
+                // The main thread has not advanced past the stalled heartbeat.
+                recovered: false,
                 frames: [], screenId: screen).utf8)
         }
         ctx.requestDrain("hang")
@@ -394,7 +390,9 @@ public enum RnIncidentObserver {
         // fields[0] is the frame INDEX — the envelope carries its own `index`,
         // so the line's copy is dropped rather than duplicated into the symbol.
         let module = fields[1..<ai].joined(separator: " ")
-        var symbol = fields[(ai + 1)...].joined(separator: " ")
+        var symbol = fields[(ai + 1)...].filter { f in
+            !(f.hasPrefix("0x") && f.dropFirst(2).allSatisfy { $0.isHexDigit })
+        }.joined(separator: " ")
         // Trailing ` + <offset>` is an address-relative displacement; it is a
         // layout fact, not a name.
         if let plus = symbol.range(of: " + ", options: .backwards),

@@ -1483,6 +1483,30 @@ public object LossAuthority {
     public fun scanSessionIndexesAtOpen(filesDir: File): IndexScan =
         scanSessionIndexes(filesDir, { AuthorityKeys.authorityKey() })
 
+    /** Pending checkpoints survive empty queues. Unknown filesystem/key state
+     * retains the worker obligation rather than reporting an empty install. */
+    public fun hasPendingRecovery(filesDir: File): Boolean {
+        val root = EncryptedAuthorityStore.rootFor(filesDir)
+        val attributes = try {
+            java.nio.file.Files.readAttributes(root.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+        } catch (_: java.nio.file.NoSuchFileException) { return false }
+          catch (_: Throwable) { return true }
+        if (!attributes.isDirectory) return true
+        return try {
+            val dirs = root.listFiles() ?: return true
+            dirs.any { dir ->
+                val sid = AuthorityNaming.decodeSessionDirName(dir.name)
+                if (sid == null) dir.isDirectory
+                else if (!dir.isDirectory) true
+                else if (EncryptedAuthorityStore.isPruned(dir)) false
+                else when (val opened = openExisting(filesDir, sid)) {
+                    is Open.Unavailable -> true
+                    is Open.Ok -> opened.handle.pendingCheckpoint() != null
+                }
+            }
+        } catch (_: Throwable) { true }
+    }
+
     /**
  * **F7 R-2 CROSS-LAUNCH — the session ids that have a LIVE authority
  * directory on disk, other than [exclude].** A NAME LIST ONLY: it opens

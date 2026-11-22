@@ -56,3 +56,15 @@ precondition(s.enqueue(expected:retained,bytes) == nil);precondition(s.sequence 
 s.replace(nil);precondition(!s.applyUserId("refused"));precondition(s.enqueue(expected:retained,bytes) == nil)
 print("PASS old session and missing session refuse without sequence allocation")
 ''')
+
+# Exercise the production backtrace parser independently of UIKit.
+s=(r/'ios/TraceScoutRN/RnIncidentObserver.swift').read_text()
+parser=block('static func parseBacktraceLine(')
+print('enum BacktraceProbe {\n'+parser+'\n}')
+print(r'''let unknown = BacktraceProbe.parseBacktraceLine("4 App 0x100001234 0x100000000 + 4660")
+precondition(unknown.module == "App")
+precondition(!(unknown.symbol ?? "").contains("0x"))
+let known = BacktraceProbe.parseBacktraceLine("4 App 0x100001234 namedFunction + 42")
+precondition(known.symbol == "namedFunction")
+print("PASS actual Swift backtrace parser strips unsymbolicated addresses and preserves symbols")
+''')

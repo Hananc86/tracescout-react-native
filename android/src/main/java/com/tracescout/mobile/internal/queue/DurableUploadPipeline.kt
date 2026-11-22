@@ -449,7 +449,20 @@ class DurableUploadPipeline(
  * the behaviour that matters, that one process makes at most ONE carrier
  * attempt per session however many times it drains.
  */
-    private val f15Declined = HashSet<String>()
+    // QueueHome is canonical across drain instances. A new pipeline must not
+    // reset a process-local decline or burst budget for the same project.
+    private class CarrierBudget {
+        val declined = HashSet<String>()
+        val attempts = HashMap<String, Int>()
+        val burstAt = HashMap<String, Long>()
+    }
+    private object CarrierBudgets {
+        private val homes = java.util.WeakHashMap<QueueHome, MutableMap<String, CarrierBudget>>()
+        @Synchronized fun forHome(home: QueueHome, project: String): CarrierBudget =
+            homes.getOrPut(home) { HashMap() }.getOrPut(project) { CarrierBudget() }
+    }
+    private val carrierBudget = CarrierBudgets.forHome(home, projectId)
+    private val f15Declined = carrierBudget.declined
 
     /**
  * **F-15 — how many carrier attempts one session may spend in ONE BURST.**
@@ -477,7 +490,7 @@ class DurableUploadPipeline(
  * nothing. Persisting either one would be a new durable fact, and a bad hour
  * must not outlive the process that had it.
  */
-    private val f15CarrierAttempts = HashMap<String, Int>()
+    private val f15CarrierAttempts = carrierBudget.attempts
 
     /**
  * **F-15 — the monotonic instant one session's carrier burst was SPENT.**
@@ -486,7 +499,7 @@ class DurableUploadPipeline(
  * [F15_CARRIER_ATTEMPTS_PER_BURST], read only by [f15Burst]. Absent means
  * either the burst is not spent or this process never spent one.
  */
-    private val f15CarrierBurstAt = HashMap<String, Long>()
+    private val f15CarrierBurstAt = carrierBudget.burstAt
 
     /**
  * **F-15 — carrier attempts made by the CURRENT drain, across all sessions.**
@@ -965,7 +978,7 @@ class DurableUploadPipeline(
             "epoch" to drainEpoch.take(12), "why" to why)
     }
 
-    fun upload(records: List<ByteArray>, fallbackSessionId: String) {
+    fun upload(records: List<ByteArray>, fallbackSessionId: String): Unit = synchronized(carrierBudget) {
         drainPosted = 0; drainProgressed = false; drainEpoch = ""
         var died = false
         try {
@@ -1019,7 +1032,7 @@ class DurableUploadPipeline(
                 // candidate's obligation with a later successful/refused one.
                 val retryOwed = when (outcome) {
                     is MetadataOnly.NotSent -> outcome.code !in setOf(
-                        "carrier_project_unproven", "carrier_project_mismatch")
+                        "carrier_project_unproven", "carrier_project_mismatch", "carrier_declined")
                     is MetadataOnly.Unacknowledged -> outcome.action != ResponseAction.TERMINAL
                     is MetadataOnly.Acknowledged -> outcome.settlement is AttributionSink.Settlement.NotDurable ||
                         outcome.settlement is AttributionSink.Settlement.Refused
@@ -1240,6 +1253,23 @@ class DurableUploadPipeline(
             }
             val n = slice.size
             val batch = BatchIdentity.of(batchSession, slice)
+            val ownershipRefusal = sliceProjectRefusal(slice)
+            if (ownershipRefusal != null) {
+                if (ownershipRefusal == "slice_project_mismatch" && parkPrefix(n, batch, slice, ownershipRefusal)) {
+                    inflight.clear()
+                    rest = rest.subList(n, rest.size)
+                    drainProgressed = true
+                    resume = null
+                    results.last = null
+                    disposition = if (rest.isEmpty()) Disposition.EMPTY else Disposition.TERMINAL_MOVED_AND_MORE_REMAIN
+                    continue@slices
+                }
+                // No durable preservation means the active prefix stays.
+                results.last = localRefusal(ownershipRefusal)
+                disposition = Disposition.RETRYABLE_REMAINING
+                return
+            }
+
 
             // **F-15 — EVERY NEWLY SELECTED SESSION PREFIX IS ASKED, NOT
             // ONLY THE ORIGINAL `rest` HEAD.** A drain CROSSES SESSIONS: the
@@ -1572,28 +1602,8 @@ class DurableUploadPipeline(
                 // therefore also covers the RESUMED path — `pending != null`
                 // above re-slices a persisted descriptor byte-identically, and
                 // a descriptor frozen under one tenant must not be replayed
-                // under another's credential just because it survived a
-                // process. And it re-evaluates per attempt, so a retry is
-                // gated exactly as the first try is.
-                sliceProjectRefusal(slice)?.let { why ->
-                    // NON-SENDING, and the queue is untouched: no record is
-                    // removed, parked or quarantined, and no terminal loss is
-                    // invented. The frozen descriptor stays on purpose — the
-                    // next drain resumes these exact bytes, and when it runs
-                    // under the credential that DOES own them the resume
-                    // delivers and settles them with the same chunk id, so a
-                    // mis-scoped process costs a retry and never a record.
-                    RecoveryTrace.log(
-                        "post_refused_ownership",
-                        "why" to why,
-                        "chunk" to batch.chunkId.take(12),
-                        "recordCount" to n,
-                        "attempt" to attempt,
-                    )
-                    results.last = localRefusal(why)
-                    disposition = Disposition.RETRYABLE_REMAINING
-                    return
-                }
+                // under another's credential. Ownership was checked for this
+                // immutable slice before checkpoint construction or posting.
                 RecoveryTrace.log("http_request_started", "attempt" to attempt)
                 if (slice.all { recordField(it, "projectId") == projectId } &&
                     !projectBoundBeforePost(batchSession, batch.chunkId)) {
@@ -2892,6 +2902,17 @@ class DurableUploadPipeline(
             return MetadataOnly.NotSent("carrier_project_unproven")
         if (sliceProjectRefusal(owned) != null)
             return MetadataOnly.NotSent("carrier_project_mismatch")
+        if (f15Declined.contains(sessionId)) return MetadataOnly.NotSent("carrier_declined")
+        if (f15Burst(sessionId) == F15Burst.COOLING) return MetadataOnly.NotSent("carrier_burst_cooling")
+        if (f15DrainAttempts >= F15_CARRIER_ATTEMPTS_PER_DRAIN) return MetadataOnly.NotSent("carrier_drain_budget")
+        if (f15Burst(sessionId) == F15Burst.COOLED) {
+            f15CarrierAttempts.remove(sessionId)
+            f15CarrierBurstAt.remove(sessionId)
+        }
+        val attempt = (f15CarrierAttempts[sessionId] ?: 0) + 1
+        f15CarrierAttempts[sessionId] = attempt
+        f15DrainAttempts++
+        if (attempt >= F15_CARRIER_ATTEMPTS_PER_BURST) f15CarrierBurstAt[sessionId] = monotonicNanos()
         // The ONE body encoder, with an EMPTY slice: `"events":[]`.
         val body = encodeBody(sessionId, doc.chunkId, emptyList(), doc.json, recovery = doc.retry)
         RecoveryTrace.log(
@@ -2913,6 +2934,12 @@ class DurableUploadPipeline(
             return MetadataOnly.Unacknowledged(r.status, r.code, r.action)
         }
         val settlement = settleLossCheckpoint(sessionId, loss)
+        if (settlement is AttributionSink.Settlement.PolicyDeclined) f15Declined.add(sessionId)
+        if (attribution.f7PendingClaim(sessionId) is AttributionSink.PendingClaim.None) {
+            f15Declined.remove(sessionId)
+            f15CarrierAttempts.remove(sessionId)
+            f15CarrierBurstAt.remove(sessionId)
+        }
         return MetadataOnly.Acknowledged(loss.state, settlement)
     }
 
@@ -3050,35 +3077,8 @@ class DurableUploadPipeline(
                 is F15Gate.Unresolved -> F15Gate.Unresolved("emitter_omitted", retryable = true)
             }
         }
-        // **A COOLED BURST IS FORGIVEN HERE, AT THE ONE MUTATION SITE.**
-        // [f15Burst] is a pure read asked per prefix; clearing the counter from
-        // it would make a documented pure read mutate. So the forgiveness lands
-        // where the budget is spent: a burst whose cooldown has elapsed is
-        // DISCARDED before counting, which is what makes the next attempt the
-        // FIRST of a fresh bounded burst rather than a fourth that overruns the
-        // bound. Nothing durable is written and no second request is made.
-        if (f15Burst(session) == F15Burst.COOLED) {
-            val forgiven = f15CarrierAttempts.remove(session) ?: 0
-            f15CarrierBurstAt.remove(session)
-            RecoveryTrace.log("f15_burst_forgiven",
-                "session" to session.take(24), "spent" to forgiven)
-        }
-        // THE ATTEMPT IS COUNTED BEFORE THE REQUEST, NOT AFTER. A carrier POST
-        // that throws, or a process killed mid-flight, must still have consumed
-        // budget — otherwise an attempt that always dies at the same point is
-        // free and the bound cannot be reached.
-        val attempt = (f15CarrierAttempts[session] ?: 0) + 1
-        f15CarrierAttempts[session] = attempt
-        f15DrainAttempts += 1
-        // The instant the burst was SPENT, so [f15Burst] can time the cooldown
-        // from it. Written on the attempt that reaches the bound, never earlier:
-        // a cooldown that started before the budget ran out would shorten it.
-        if (attempt >= F15_CARRIER_ATTEMPTS_PER_BURST) {
-            f15CarrierBurstAt[session] = monotonicNanos()
-        }
-        RecoveryTrace.log("f15_reconcile_attempt",
-            "session" to session.take(24), "batchFirst" to batchFirst,
-            "attempt" to attempt)
+        // The common carrier path charges the process-local budget before POST;
+        // empty-queue recovery uses that same budget.
         val outcome = postCarrierDocument(
             session, doc,
             requestEvent = "f15_reconcile_request",

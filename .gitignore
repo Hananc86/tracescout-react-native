@@ -9,3 +9,5 @@ __pycache__/
 scripts/ci/android/.gradle/
 scripts/ci/android/build/
 ci-results/
+
+scripts/ci/android/.kotlin/
