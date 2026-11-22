@@ -983,6 +983,7 @@ class DurableUploadPipeline(
         var died = false
         try {
             uploadInner(records, fallbackSessionId)
+            if (disposition == Disposition.EMPTY) recoverEmpty(fallbackSessionId)
         } catch (t: SimulatedProcessDeath) {
             died = true; throw t
         } finally {
@@ -1014,7 +1015,24 @@ class DurableUploadPipeline(
         // named by the durable record itself, never by a pointer this
         // process happens to hold — a process that died holds nothing.
         for (s in chunklessFinalityCandidates(fallbackSessionId)) {
-            val retry = attribution.f7PendingCheckpointRetry(s)
+            if (s.isBlank()) continue
+            val claim = try { attribution.f7PendingClaim(s) } catch (t: Throwable) {
+                if (t is SimulatedProcessDeath) throw t
+                AttributionSink.PendingClaim.Unreadable(t.javaClass.simpleName)
+            }
+            if (claim is AttributionSink.PendingClaim.Unreadable) {
+                disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
+                continue
+            }
+            val retry = try { attribution.f7PendingCheckpointRetry(s) } catch (t: Throwable) {
+                if (t is SimulatedProcessDeath) throw t
+                disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
+                continue
+            }
+            if (claim is AttributionSink.PendingClaim.Pending && retry == null) {
+                disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
+                continue
+            }
             val outcome = if (retry != null) postCarrierDocument(s, retry,
                 "f7_metadata_only_request", "f7_metadata_only_retry",
                 "f7_metadata_only_transport_failed", "f7_metadata_only_unacknowledged")
@@ -1042,7 +1060,7 @@ class DurableUploadPipeline(
         // An empty queue must not produce a request at all. A round trip that
         // could only ever be answered "nothing happened" is an invitation to
         // read a 2xx as progress.
-        if (records.isEmpty()) { recoverEmpty(fallbackSessionId); return }
+        if (records.isEmpty()) { disposition = Disposition.EMPTY; return }
 
         // A batch is addressed by the session its RECORDS carry — never by
         // whichever session happens to be running. Recovery uploads a PREVIOUS
@@ -1105,7 +1123,7 @@ class DurableUploadPipeline(
         }
         if (rest.isEmpty()) {
             RecoveryTrace.log("upload_empty_after_reconcile")
-            recoverEmpty(fallbackSessionId)
+            disposition = Disposition.EMPTY
             return
         }
         // E-5 — THE SIXTH SAME-IMAGE ATTEMPT REFUSES BEFORE ANY REQUEST IS
@@ -3230,6 +3248,7 @@ class DurableUploadPipeline(
         } catch (t: Throwable) {
             if (t is SimulatedProcessDeath) throw t
             RecoveryTrace.log("f7_inherited_candidates_threw", "why" to t.javaClass.simpleName)
+            disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
             emptyList()
         }
         if (inherited.isEmpty()) return listOf(fallbackSessionId)

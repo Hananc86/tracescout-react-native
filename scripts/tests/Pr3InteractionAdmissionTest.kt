@@ -13,6 +13,24 @@ import com.tracescout.mobile.queue.DurableReplace
 import javax.crypto.KeyGenerator
 
 class Pr3InteractionAdmissionTest {
+    @Test fun belowSlopSamplesCannotRelaxGesturePrivacy() {
+        val safe=com.tracescout.mobile.capture.interaction.GestureLifecycle.SampleFacts("screen",false,false,true,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.TargetClass.SAFE,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED,100,100)
+        for(restricted in listOf(safe.copy(positionTreatment=com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.BLOCKED),
+            safe.copy(textEntryActive=true),safe.copy(screenNeverRecord=true),safe.copy(fromContentWindow=false),safe.copy(screenId="other"))) {
+            for(swipe in listOf(false,true)) {
+                val g=com.tracescout.mobile.capture.interaction.GestureLifecycle(10f)
+                fun sample(action:com.tracescout.mobile.capture.interaction.GestureLifecycle.Action,x:Float)=
+                    com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(action,0,x,1f,1000000,1)
+                g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,1f),safe)
+                g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.MOVE,2f),restricted)
+                val rows=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,if(swipe)30f else 1f),safe)
+                assertTrue("transient restriction leaked positional gesture",rows.all{it.facts.positionTreatment!=com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED})
+            }
+        }
+    }
+
     @Test fun actualHostGatePausedBeforeEmissionRejectsSessionReplacementTruthfully() {
         fun field(name:String)=TraceScoutMobile::class.java.getDeclaredField(name).apply{isAccessible=true}
         val names=listOf("identity","clock","hostInteractionsEnabled","interactionScreen")

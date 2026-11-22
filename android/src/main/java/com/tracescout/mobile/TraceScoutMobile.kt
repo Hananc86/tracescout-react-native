@@ -1754,6 +1754,13 @@ object TraceScoutMobile {
         return emitted
     }
 
+    private fun publishCaptureRoute(expected: Envelope.SessionIdentity, screenId: String): Boolean = synchronized(identityWriteLock) {
+        val live = identity ?: return@synchronized false
+        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false
+        interactionScreen = screenId
+        true
+    }
+
     @JvmStatic
     @JvmOverloads
     fun captureScreen(root: View, screenId: String, budget: ViewHierarchySnapshotter.Budget =
@@ -1774,7 +1781,7 @@ object TraceScoutMobile {
         spanId: String? = null,
     ): Boolean = guard("capture") {
         val id = identity ?: return@guard false
-        interactionScreen = screenId
+        if (!publishCaptureRoute(id, screenId)) return@guard false
 
         // NEVER-RECORD IS DECIDED BEFORE THE WALK, NOT AFTER IT.
         // Snapshotting first and discarding the result would put the screen's
@@ -2106,7 +2113,7 @@ object TraceScoutMobile {
         // byte upload, with the capture-time monotonic clock — exactly the
         // RN producer's order (RnBridge.emitFrameEvent). A frame whose bytes
         // later fail renders as a typed placeholder at its correct time.
-        enqueueDisclosing(id) { id, d ->
+        val frameAdmission = enqueueDisclosing(id) { id, d ->
             Envelope.visualFrame(
                 id, admit("mobile_visual_frame"), captureMono, posture(),
                 screenId = screenId, visualFrameId = frameId,
@@ -2117,6 +2124,10 @@ object TraceScoutMobile {
                 privacyState = frame.privacyState,
                 captureReason = frame.captureReason, clock = clock, dropped = d,
             )
+        }
+        if (frameAdmission != EnqueueAdmission.SUBMITTED) {
+            lastFrameRefusal = "metadata_admission_refused"
+            return@guard null
         }
         // RASTERIZE on the caller's thread (it had to be — reading a live View
         // off the main thread is undefined behaviour), then hand the finished

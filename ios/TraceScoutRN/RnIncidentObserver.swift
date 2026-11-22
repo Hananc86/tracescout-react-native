@@ -229,12 +229,9 @@ public enum RnIncidentObserver {
         let mono = Int64(DispatchTime.now().uptimeNanoseconds)
         let posture = ctx.posture()
         let screen = ctx.screenId()
-        // `exception.name` IS THE TYPE, `exception.reason` IS THE MESSAGE —
-        // and only the first is emitted. `reason` is where application code
-        // interpolates values ("could not load user hanan@example.com"), which
-        // is exactly the rule the Android native producer states and this
-        // programme inherits.
-        let typeName = exception.name.rawValue
+        // Names can contain application error text too; only fixed identifiers
+        // may cross the telemetry boundary. The reason is never recorded.
+        let typeName = IncidentPolicy.safeExceptionType(exception.name.rawValue)
         let appended = ctx.appendIdentified(id) { assigned, id in
             Data(RnEnvelope.crash(
                 id: id, eventId: eventId, sequence: assigned,

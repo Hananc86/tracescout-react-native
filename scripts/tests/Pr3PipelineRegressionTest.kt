@@ -217,6 +217,36 @@ class Pr3PipelineRegressionTest {
         assertEquals("parking must not rewrite a frozen claim",frozen,snapshot(h.pendingCheckpoint()))
     }
 
+    @Test fun successfulFinalChunkWithoutLossAckRetainsCarrierRetry() {
+        val f=tmp();val h=strand(f,0,0,0);val q=queue(f);q.append(owned(0))
+        val bodies=ArrayList<String>()
+        val p=pipelineWith(f,q,bodies,realSink(f)){if(isCarrier(it)) Uploader.Result(ResponseAction.RETRY,503,"busy") else chunkOk(it)}
+        p.upload(q.readAll().records,sid)
+        assertTrue(q.readAll().records.isEmpty());assertNotNull(h.pendingCheckpoint())
+        assertEquals("event delivery must hand off to metadata-only recovery",2,bodies.size)
+        assertTrue(isCarrier(bodies.last()));assertEquals(DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED,p.disposition)
+    }
+
+    @Test fun emptyQueueUnreadableAuthorityRetainsRetryWithoutPosting() {
+        for(mode in listOf("unreadable","throws","missing-carrier","enumeration-throws")) {
+            val f=tmp();val q=queue(f);val delegate=realSink(f);val bodies=ArrayList<String>()
+            val sink=object:AttributionSink by delegate {
+                override fun f7PendingClaim(sessionId:String):AttributionSink.PendingClaim = when(mode) {
+                    "throws"->error("temporary-key-outage")
+                    "missing-carrier"->AttributionSink.PendingClaim.Pending(9)
+                    else->AttributionSink.PendingClaim.Unreadable("temporary-key-outage")
+                }
+                override fun f7InheritedSessions(sessionId:String):List<String> {
+                    if(mode=="enumeration-throws")error("temporary-directory-outage")
+                    return emptyList()
+                }
+            }
+            val p=pipelineWith(f,q,bodies,sink){error("must not post unproven claim")}
+            p.upload(emptyList(),sid)
+            assertTrue(bodies.isEmpty());assertEquals(mode,DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED,p.disposition)
+        }
+    }
+
     @Test fun freshPipelinesShareCarrierCooldown() {
         val f=tmp();strand(f,0,6,8);val q=queue(f);q.append(rec(7));q.append(rec(8))
         val bodies=ArrayList<String>();val mono=Mono()
@@ -553,8 +583,12 @@ class Pr3PipelineRegressionTest {
             assertEquals("frozen attachment choice must survive upgrade",oldBody,bodies.last())
             assertEquals(2,bodies.size);assertEquals(5,q.readAll().records.size)
             assertTrue(store.save(store.load()!!.copy(contentSha256="f".repeat(64))))
-            pipeline(f,q,bodies){error("corrupt descriptor reached HTTP")}.upload(q.readAll().records,sid)
-            assertEquals(2,bodies.size);assertEquals(15L,authority(f).pendingCheckpoint()!!.throughSequence)
+            pipeline(f,q,bodies){body ->
+                assertTrue("corrupt descriptor must never reach event delivery",isCarrier(body))
+                Uploader.Result(ResponseAction.RETRY,503,"temporary")
+            }.upload(q.readAll().records,sid)
+            assertEquals(3,bodies.size);assertTrue(isCarrier(bodies.last()))
+            assertEquals(15L,authority(f).pendingCheckpoint()!!.throughSequence)
         }
     }
 

@@ -121,6 +121,7 @@ jobs:
           python3 scripts/tests/pr3-swift-probe.py > ci-results/swift/main.swift
           swiftc ci-results/swift/main.swift -o ci-results/swift/probe 2>&1 | tee ci-results/swift/compile.log
           ci-results/swift/probe | tee ci-results/swift/run.log
+          python3 scripts/ci/swift-exception-control.py | tee ci-results/swift/exception-control.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -6,7 +6,7 @@ that retaining the old producer identity makes the interleaving test fail.
 """
 from pathlib import Path
 import argparse, subprocess, tempfile
-p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');p.add_argument('--mutate-frame',action='store_true');p.add_argument('--mutate-route',action='store_true');a=p.parse_args()
 r=Path(__file__).resolve().parents[2];out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
 def read(n):return (r/'android/src/main/java/com/tracescout/mobile'/n).read_text()
 def block(s,start):
@@ -21,6 +21,11 @@ assert start.index('LossAuthority.open(')<start.index('val liveUploader = Upload
 print('PASS source guard: throwing authority/reconciliation/uploader construction precedes config publication',flush=True)
 identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun').replace('noinline onSubmitted','onSubmitted')
 if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected, d)')
+route=block(s,'private fun publishCaptureRoute(').replace('private fun','fun')
+if a.mutate_route:route=route.replace('if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false','')
+frame=block(s,'if (frameAdmission != EnqueueAdmission.SUBMITTED)').replace('return@guard','return')
+assert s.index('val frameAdmission = enqueueDisclosing(id)') < s.index('if (frameAdmission != EnqueueAdmission.SUBMITTED)') < s.index('// RASTERIZE on the caller')
+if a.mutate_frame:frame=frame.replace('frameAdmission != EnqueueAdmission.SUBMITTED','false')
 end=block(s,'val endAdmission = synchronized(identityWriteLock)').replace('return@guard','return')
 q=read('queue/QueueKeyStores.kt');sweep=block(q,'fun clearOwnedFrameFiles(')
 w=read('queue/RecoveryWorker.kt');metadata=w[w.index('internal fun undeliveredRecordBytes'):w.index('\n        /**',w.index('internal fun undeliveredRecordBytes'))]
@@ -47,7 +52,14 @@ class Subject {
  fun enqueue(r:Envelope.Record)=true
  fun identify(user:String)=synchronized(identityWriteLock){identity=identity?.copy(userId=user)}
  fun replace(id:Envelope.SessionIdentity?)=synchronized(identityWriteLock){identity=id}
-'''+identity+'''
+'''+identity+route+'''
+ var interactionScreen:String?=null
+ var lastFrameRefusal:String?=null
+ var frameUploads=0
+ fun frameAfterMetadata(frameAdmission:EnqueueAdmission):String? {
+ '''+frame+'''
+ frameUploads++;return "frame"
+ }
  val sessionEndClaim=java.util.concurrent.atomic.AtomicReference<String?>(null)
  enum class SessionEndEmission { NO_SESSION, ALREADY_EMITTED, EMITTED }
  fun claimEnd():SessionEndEmission {
@@ -90,6 +102,17 @@ fun main() {
  check(s.enqueueDisclosing(initial,onSubmitted={moved=true}){_,_->error("stale builder executed")}==Subject.EnqueueAdmission.NO_SESSION);check(!moved)
  check(s.enqueueDisclosing(s.identity!!,onSubmitted={moved=true}){_,_->Envelope.Record("ok")}==Subject.EnqueueAdmission.SUBMITTED);check(moved)
  println("PASS old session, no session and foreign project refuse before allocation; admission callback runs only on SUBMITTED")
+ s.interactionScreen="new-route"
+ check(!s.publishCaptureRoute(initial,"stale-route")) { "stale capture route accepted" }
+ check(s.interactionScreen=="new-route") { "stale capture replaced current route" }
+ check(s.publishCaptureRoute(s.identity!!,"current-route"));check(s.interactionScreen=="current-route")
+ println("PASS stale capture route refuses publication while current session route updates")
+ for(outcome in listOf(Subject.EnqueueAdmission.NO_SESSION,Subject.EnqueueAdmission.REFUSED)) {
+  check(s.frameAfterMetadata(outcome)==null) { "frame upload accepted refused metadata" }
+  check(s.frameUploads==0)
+ }
+ check(s.frameAfterMetadata(Subject.EnqueueAdmission.SUBMITTED)=="frame");check(s.frameUploads==1)
+ println("PASS frame bytes require submitted metadata")
  s.replace(initial)
  val attempted=CountDownLatch(1)
  val stale=Thread { attempted.countDown(); s.claimEnd() }

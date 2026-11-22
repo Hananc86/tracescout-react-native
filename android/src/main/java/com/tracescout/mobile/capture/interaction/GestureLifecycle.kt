@@ -140,6 +140,12 @@ class GestureLifecycle(
             Action.MOVE -> {
                 val l = live ?: return emptyList()
                 if (s.pointerId != l.pointerId) { l.classification = Classification.INVALIDATED; return emptyList() }
+                // Every observation restricts the gesture, even before slop or
+                // move throttling permits a row. Restrictions never disappear.
+                if (l.downFacts.authority() != facts.authority()) {
+                    l.classification = Classification.INVALIDATED; return emptyList()
+                }
+                l.authority = PositionTreatment.strongest(l.authority, facts.positionTreatment)
                 when (l.classification) {
                     Classification.INVALIDATED -> return emptyList()
                     Classification.TAP_CANDIDATE -> {
@@ -181,13 +187,14 @@ class GestureLifecycle(
                         // A sparse drag can pass the slop between the last MOVE and UP.
                         if (passedSlop(l, s)) {
                             if (l.downFacts.authority() != facts.authority()) return emptyList()
+                            l.authority = PositionTreatment.strongest(l.authority, facts.positionTreatment)
                             val begin = promote(l)
                             val a = PositionTreatment.strongest(l.authority, facts.positionTreatment)
                             return listOf(begin, Persist(Kind.SWIPE, Phase.END, l.gestureId, s, withAuthority(facts, a)))
                         }
                         // A different screen at release is not the gesture that began.
                         if (l.downFacts.screenId != facts.screenId) return emptyList()
-                        return listOf(Persist(Kind.TAP, null, l.gestureId, l.down, join(l.downFacts, facts)))
+                        return listOf(Persist(Kind.TAP, null, l.gestureId, l.down, withAuthority(join(l.downFacts, facts), PositionTreatment.strongest(l.authority, facts.positionTreatment))))
                     }
                 }
             }

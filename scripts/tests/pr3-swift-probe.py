@@ -68,3 +68,14 @@ let known = BacktraceProbe.parseBacktraceLine("4 App 0x100001234 namedFunction +
 precondition(known.symbol == "namedFunction")
 print("PASS actual Swift backtrace parser strips unsymbolicated addresses and preserves symbols")
 ''')
+
+s=(r/'ios/TraceScoutRN/IncidentPolicy.swift').read_text()
+policy=block('public static func safeExceptionType(')
+print('enum ExceptionPrivacyProbe {\n'+policy+'\n}')
+print(r'''for raw in ["RCTFatalException: token=synthetic-secret", "user@example.test", "NSRangeException private detail"] {
+    precondition(ExceptionPrivacyProbe.safeExceptionType(raw) == "NSException", "exception name privacy leak")
+}
+precondition(ExceptionPrivacyProbe.safeExceptionType("NSRangeException") == "NSRangeException")
+precondition(ExceptionPrivacyProbe.safeExceptionType("RCTFatalException") == "RCTFatalException")
+print("PASS actual Swift exception policy excludes arbitrary names and preserves exact known identifiers")
+''')

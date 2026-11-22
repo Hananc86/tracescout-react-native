@@ -102,6 +102,18 @@ public enum IncidentPolicy {
 
     /// Classify an iOS incident by the SEAM that observed it.
     ///
+    /// NSException names are arbitrary application text, including React error
+    /// messages. Preserve only exact known identifiers; never serialize a suffix.
+    public static func safeExceptionType(_ raw: String) -> String {
+        let known: Set<String> = ["NSException", "NSGenericException",
+            "NSRangeException", "NSInvalidArgumentException",
+            "NSInternalInconsistencyException", "NSMallocException",
+            "NSInvalidDestinationException", "NSPortTimeoutException",
+            "NSInvalidSendPortException", "NSInvalidReceivePortException",
+            "NSPortSendException", "NSPortReceiveException", "RCTFatalException"]
+        return known.contains(raw) ? raw : "NSException"
+    }
+
     /// THE SEAM, NOT THE SYMPTOM, AND THAT BOUNDS WHAT iOS CAN CLAIM.
     /// `NSSetUncaughtExceptionHandler` observes an `NSException` only. A Swift
     /// `fatalError`, a nil force-unwrap, an array bound and an integer overflow
