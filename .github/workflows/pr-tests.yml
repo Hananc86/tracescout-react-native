@@ -19,13 +19,19 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Record checked-out subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-results
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
-      - name: Install the host compilation SDK
-        run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
+        with:
+          packages: 'platforms;android-35 build-tools;34.0.0'
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.14.3'
@@ -34,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-results
-          git rev-parse HEAD | tee ci-results/head.txt
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
           gradle -p scripts/ci/android :tracescout:testDebugUnitTest probeCompiler --no-daemon --console=plain 2>&1 | tee ci-results/android.log
           python3 scripts/ci/check-junit.py | tee ci-results/junit-counts.txt
       - name: Kotlin identity and admission controls
@@ -57,6 +63,12 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Record checked-out subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-results
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -65,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-results
-          git rev-parse HEAD | tee ci-results/head.txt
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
           # Install pinned React Native declarations; no host application is launched.
           npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund 2>&1 | tee ci-results/install.log
           npm run typecheck 2>&1 | tee ci-results/typescript.log
@@ -88,12 +100,18 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Record checked-out subject
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-results
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
       - name: Execute extracted Swift transport interleavings (no UIKit or React runtime)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ci-results/swift
-          git rev-parse HEAD | tee ci-results/head.txt
+          git -c safe.directory="$PWD" rev-parse HEAD | tee ci-results/head.txt
           swiftc --version | tee ci-results/swift/version.txt
           python3 scripts/tests/pr3-swift-probe.py > ci-results/swift/main.swift
           swiftc ci-results/swift/main.swift -o ci-results/swift/probe 2>&1 | tee ci-results/swift/compile.log
