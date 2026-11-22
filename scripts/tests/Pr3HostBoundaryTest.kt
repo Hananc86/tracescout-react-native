@@ -14,6 +14,45 @@ import org.junit.Test
 import kotlin.concurrent.withLock
 
 class Pr3HostBoundaryTest {
+    @Test fun rnTeardownPreservesNativeFirstAndForeignCrashHandlers() {
+        val dir=java.nio.file.Files.createTempDirectory("pr3-handler-owner").toFile()
+        val context=object:ContextWrapper(null) {
+            override fun getFilesDir()=dir
+            override fun getApplicationContext():Context=this
+        }
+        val key=javax.crypto.KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val q=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,"queue.bin"),key,1024*1024,
+            com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,com.tracescout.mobile.queue.DurableReplace.DirSync{true})
+        val store=RnTransport::class.java.getDeclaredField("store").apply{isAccessible=true}
+        val previousStore=store.get(RnTransport)
+        val previous=Thread.getDefaultUncaughtExceptionHandler()
+        val host=Thread.UncaughtExceptionHandler{_,_->}
+        val ctx=object:RnIncidentCapture.Context2 {
+            override fun identity():RnEnvelope.Identity?=null
+            override fun posture()=RnEnvelope.Posture(allowedViewCount=0,screenNeverRecord=false)
+            override fun screenId():String?=null
+        }
+        val install=RnIncidentCapture::class.java.getDeclaredMethod("installCrash",Context::class.java,RnIncidentCapture.Context2::class.java).apply{isAccessible=true}
+        try {
+            RnIncidentCapture.uninstall();store.set(RnTransport,q)
+            Thread.setDefaultUncaughtExceptionHandler(host)
+            val native=com.tracescout.mobile.capture.CrashHandler.install(q){_,_->byteArrayOf()}!!
+            install.invoke(RnIncidentCapture,context,ctx)
+            assertSame(native,Thread.getDefaultUncaughtExceptionHandler())
+            RnIncidentCapture.uninstall()
+            assertSame("RN removed native-first crash handler",native,Thread.getDefaultUncaughtExceptionHandler())
+            com.tracescout.mobile.capture.CrashHandler.uninstall()
+            install.invoke(RnIncidentCapture,context,ctx)
+            assertTrue(Thread.getDefaultUncaughtExceptionHandler() is com.tracescout.mobile.capture.CrashHandler)
+            RnIncidentCapture.uninstall();assertSame(host,Thread.getDefaultUncaughtExceptionHandler())
+            RnIncidentCapture.uninstall();assertSame(host,Thread.getDefaultUncaughtExceptionHandler())
+            install.invoke(RnIncidentCapture,context,ctx)
+            val newer=Thread.UncaughtExceptionHandler{_,_->}
+            Thread.setDefaultUncaughtExceptionHandler(newer)
+            RnIncidentCapture.uninstall();assertSame(newer,Thread.getDefaultUncaughtExceptionHandler())
+        } finally {RnIncidentCapture.uninstall();Thread.setDefaultUncaughtExceptionHandler(previous);store.set(RnTransport,previousStore);dir.deleteRecursively()}
+    }
+
     @Test fun indeterminateOpenerCannotPublishThroughRealTransport() {
         val dir=java.nio.file.Files.createTempDirectory("pr3-opener").toFile()
         val context=object:ContextWrapper(null) {

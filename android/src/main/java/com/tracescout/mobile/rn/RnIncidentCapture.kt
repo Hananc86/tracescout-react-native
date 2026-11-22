@@ -87,6 +87,7 @@ object RnIncidentCapture {
     }
 
     @Volatile private var detector: HangDetector? = null
+    private var ownedCrashHandler: CrashHandler? = null
 
     /**
  * The sequence this crash record claimed, handed from the record builder to
@@ -150,20 +151,26 @@ object RnIncidentCapture {
         ctx2: Context2,
         hangThresholdMs: Long = HangDetector.DEFAULT_THRESHOLD_MS,
         mainLooper: Looper = Looper.getMainLooper(),
-    ): Boolean {
-        if (!bindContext(ctx2)) return false
+    ): Boolean = synchronized(this) {
+        if (!bindContext(ctx2)) return@synchronized false
         val app = ctx.applicationContext
         installCrash(app, ctx2)
         installHang(app, ctx2, hangThresholdMs, mainLooper)
-        return true
+        true
     }
 
     /** Stop the hang watchdog and restore the previous uncaught handler. Teardown and tests. */
     @JvmStatic
-    fun uninstall() {
+    fun uninstall() = synchronized(this) {
         detector?.stop()
         detector = null
-        CrashHandler.uninstall()
+        synchronized(CrashHandler) {
+            val owned = ownedCrashHandler
+            if (owned != null && Thread.getDefaultUncaughtExceptionHandler() === owned) {
+                CrashHandler.uninstall()
+            }
+            ownedCrashHandler = null
+        }
         crashTicketSequence.set(-1L)
         crashTicket = null
         installed.set(false)
@@ -184,39 +191,46 @@ object RnIncidentCapture {
             RecoveryTrace.log("rn_crash_install_failed", "code" to t.javaClass.simpleName)
             return
         }
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
-        val handler = CrashHandler.install(
-            store,
-            afterAppend = { stored, durability ->
-                val seq = crashTicketSequence.getAndSet(-1L)
-                val ticket = crashTicket
-                crashTicket = null
-                if (seq >= 0 && ticket != null) {
-                    // THE SAME THREE-STATE SETTLEMENT AS EVERY OTHER APPEND.
-                    // Collapsing `stored && COMMITTED` into one boolean turned
-                    // `stored = true` + an INDETERMINATE directory — bytes that
-                    // may well be on disk — into a durable FALSE LOSS for a
-                    // record the next launch would then upload.
-                    RnTransport.settleIncidentAppend(app, ticket, stored, durability)
-                }
-            },
-        ) { thread, throwable ->
-            buildCurrentCrashRecord(app, thread, throwable)
+        // Share the core registration monitor: the observed predecessor and
+        // newly installed handler must belong to one installation attempt.
+        synchronized(CrashHandler) {
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+            val handler = CrashHandler.install(
+                store,
+                afterAppend = { stored, durability ->
+                    val seq = crashTicketSequence.getAndSet(-1L)
+                    val ticket = crashTicket
+                    crashTicket = null
+                    if (seq >= 0 && ticket != null) {
+                        // THE SAME THREE-STATE SETTLEMENT AS EVERY OTHER APPEND.
+                        // Collapsing `stored && COMMITTED` into one boolean turned
+                        // `stored = true` + an INDETERMINATE directory — bytes that
+                        // may well be on disk — into a durable FALSE LOSS for a
+                        // record the next launch would then upload.
+                        RnTransport.settleIncidentAppend(app, ticket, stored, durability)
+                    }
+                },
+            ) { thread, throwable ->
+                buildCurrentCrashRecord(app, thread, throwable)
+            }
+            if (handler == null) {
+                RecoveryTrace.log("rn_crash_install_refused", "why" to "handler_null")
+                return
+            }
+            // IDEMPOTENCE IS `CrashHandler`'S, AND IT RETURNS THE *EXISTING*
+            // HANDLER. In a hybrid app that ALSO ran `TraceScoutMobile.start`,
+            // the native handler is already registered and this call returns IT —
+            // so the RN record builder is never used and RN crashes are recorded
+            // as native ones. That is the correct conflict resolution (one handler,
+            // first writer wins, the host's own handler still chains) but it must
+            // be VISIBLE rather than look like a successful install.
+            if (handler === previous) {
+                RecoveryTrace.log("rn_crash_install_foreign", "class" to handler.javaClass.name)
+            } else {
+                ownedCrashHandler = handler
+                RecoveryTrace.log("rn_crash_installed")
+            }
         }
-        if (handler == null) {
-            RecoveryTrace.log("rn_crash_install_refused", "why" to "handler_null")
-            return
-        }
-        // IDEMPOTENCE IS `CrashHandler`'S, AND IT RETURNS THE *EXISTING*
-        // HANDLER. In a hybrid app that ALSO ran `TraceScoutMobile.start`,
-        // the native handler is already registered and this call returns IT —
-        // so the RN record builder is never used and RN crashes are recorded
-        // as native ones. That is the correct conflict resolution (one handler,
-        // first writer wins, the host's own handler still chains) but it must
-        // be VISIBLE rather than look like a successful install.
-        if (handler === previous) {
-            RecoveryTrace.log("rn_crash_install_foreign", "class" to handler.javaClass.name)
-        } else RecoveryTrace.log("rn_crash_installed")
     }
 
     /**

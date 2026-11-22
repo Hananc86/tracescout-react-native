@@ -112,17 +112,17 @@ class CrashHandler private constructor(
             // shape `install(store) { t, e -> bytes }` keeps binding the builder.
             afterAppend: (stored: Boolean, durability: EncryptedEventStore.Durability) -> Unit = { _, _ -> },
             recordBuilder: (Thread, Throwable) -> ByteArray,
-        ): CrashHandler? {
+        ): CrashHandler? = synchronized(this) {
             val existing = Thread.getDefaultUncaughtExceptionHandler()
-            if (existing is CrashHandler) return existing
+            if (existing is CrashHandler) return@synchronized existing
             val handler = CrashHandler(store, existing, recordBuilder, afterAppend)
             Thread.setDefaultUncaughtExceptionHandler(handler)
-            return handler
+            handler
         }
 
         /** Restore the previously-registered handler. Used by tests and teardown. */
         @JvmStatic
-        fun uninstall() {
+        fun uninstall() = synchronized(this) {
             val current = Thread.getDefaultUncaughtExceptionHandler()
             if (current is CrashHandler) {
                 Thread.setDefaultUncaughtExceptionHandler(current.previous)

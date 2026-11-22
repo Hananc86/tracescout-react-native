@@ -128,3 +128,7 @@ their intended assertions after compilation. UIKit lifecycle integration still
 requires Apple SDK/device validation. `node scripts/tests/pr3-native-dispatch.cjs`
 executes the actual TypeScript wrappers and shared dispatcher against native spies,
 and rejects a compiled dispatcher mutation that discards arguments.
+
+The RN crash-handler teardown test runs actual installation and teardown with a
+native-first handler, an RN-owned handler, repeated teardown and a newer foreign
+handler. Only an RN-owned handler that is still current may be restored.
