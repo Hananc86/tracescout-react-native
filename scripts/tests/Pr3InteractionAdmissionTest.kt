@@ -1,0 +1,211 @@
+package com.tracescout.mobile
+
+import com.tracescout.mobile.core.Clock
+import com.tracescout.mobile.emit.Envelope
+import com.tracescout.mobile.capture.interaction.HostInteraction
+import kotlin.concurrent.withLock
+import org.junit.Test
+import org.junit.Assert.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import com.tracescout.mobile.internal.loss.LossAuthority
+import com.tracescout.mobile.queue.DurableReplace
+import javax.crypto.KeyGenerator
+
+class Pr3InteractionAdmissionTest {
+    @Test fun framesRequireOneCompletedSessionTransportPublication() {
+        val subject=TraceScoutMobile
+        fun field(n:String)=subject.javaClass.getDeclaredField(n).apply{isAccessible=true}
+        val fields=listOf("identity","config","uploader","frameTransport","transportEpoch","transportOwner").associateWith{field(it)}
+        val prior=fields.mapValues{it.value.get(subject)}
+        val type=Class.forName("com.tracescout.mobile.TraceScoutMobile\$FrameTransport")
+        val ctor=type.declaredConstructors.first().apply{isAccessible=true}
+        val read=subject.javaClass.getDeclaredMethod("captureFrameTransport").apply{isAccessible=true}
+        fun set(n:String,v:Any?)=fields.getValue(n).set(subject,v)
+        val ownerType=fields.getValue("transportOwner").type
+        val live=ownerType.enumConstants.first{(it as Enum<*>).name=="LIVE"}
+        val boot=ownerType.enumConstants.first{(it as Enum<*>).name=="BOOTSTRAP"}
+        val a=Envelope.SessionIdentity("project-a","session-a","anonymous","test","1","1","app","screen")
+        val b=a.copy(projectId="project-b",sessionId="session-b")
+        val ca=TraceScoutMobile.Config("project-a","synthetic-a","https://a.invalid")
+        val cb=TraceScoutMobile.Config("project-b","synthetic-b","https://b.invalid")
+        val ua=com.tracescout.mobile.transport.Uploader(ca.baseUrl,ca.ingestKey)
+        val ub=com.tracescout.mobile.transport.Uploader(cb.baseUrl,cb.ingestKey)
+        try {
+            set("identity",a);set("config",ca);set("uploader",ua);set("frameTransport",ctor.newInstance(a.sessionId,ca,ua))
+            set("transportEpoch",2L);set("transportOwner",live);assertNotNull(read.invoke(subject))
+            set("identity",b)
+            assertNull("new session paired with foreign endpoint",read.invoke(subject))
+            set("config",cb);set("uploader",ub)
+            assertNull("unpublished frame transport accepted",read.invoke(subject))
+            set("frameTransport",ctor.newInstance(b.sessionId,cb,ub));assertNotNull(read.invoke(subject))
+            set("transportEpoch",3L);assertNull(read.invoke(subject));set("transportEpoch",4L)
+            set("transportOwner",boot);assertNull(read.invoke(subject));set("transportOwner",live)
+            set("config",ca);assertNull("torn config accepted",read.invoke(subject))
+            set("config",cb);assertNotNull("complete matching capture disabled",read.invoke(subject))
+        } finally {fields.forEach{(n,f)->f.set(subject,prior[n])}}
+    }
+
+    @Test fun concurrentCrashHandlersCannotOverwriteOutstandingAdmission() {
+        val dir=java.nio.file.Files.createTempDirectory("pr3-concurrent-crash").toFile()
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val q=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,"queue.bin"),key,1024*1024,
+            com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,DurableReplace.DirSync{true})
+        val previous=Thread.getDefaultUncaughtExceptionHandler()
+        val entered=CountDownLatch(1);val resume=CountDownLatch(1)
+        val builds=java.util.concurrent.atomic.AtomicInteger();val settled=java.util.concurrent.atomic.AtomicInteger()
+        val chained=java.util.concurrent.atomic.AtomicInteger();val errors=AtomicReference<Throwable>()
+        var first:Thread?=null
+        try {
+            Thread.setDefaultUncaughtExceptionHandler{_,_->chained.incrementAndGet()}
+            val handler=com.tracescout.mobile.capture.CrashHandler.install(q,afterAppend={stored,_->if(stored)settled.incrementAndGet()}) {_,_->
+                if(builds.incrementAndGet()==1){entered.countDown();check(resume.await(5,TimeUnit.SECONDS))}
+                "{\"eventType\":\"mobile_crash\"}".toByteArray()
+            }!!
+            first=Thread{try{handler.uncaughtException(Thread.currentThread(),Exception())}catch(t:Throwable){errors.set(t)}}
+            first.start();assertTrue(entered.await(5,TimeUnit.SECONDS))
+            handler.uncaughtException(Thread.currentThread(),Exception())
+            assertEquals("second crash overwrote outstanding admission",1,builds.get())
+            assertEquals("busy crash must still chain immediately",1,chained.get())
+            resume.countDown();first.join(5000);assertFalse(first.isAlive);assertNull(errors.get())
+            assertEquals(1,settled.get());assertEquals(1,q.readAll().records.size);assertEquals(2,chained.get())
+        } finally {resume.countDown();first?.join(5000);Thread.setDefaultUncaughtExceptionHandler(previous);dir.deleteRecursively()}
+    }
+
+    @Test fun frameMetadataCompletionReflectsGovernedAppendDurability() {
+        fun field(n:String)=TraceScoutMobile::class.java.getDeclaredField(n).apply{isAccessible=true}
+        val names=listOf("config","bracket","authority")
+        val fields=names.associateWith{field(it)};val prior=fields.mapValues{it.value.get(TraceScoutMobile)}
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val enqueue=TraceScoutMobile::class.java.getDeclaredMethod("enqueue",Envelope.Record::class.java,kotlin.jvm.functions.Function1::class.java).apply{isAccessible=true}
+        try {
+            for(mode in listOf("committed","refused","indeterminate")) {
+                val dir=java.nio.file.Files.createTempDirectory("pr3-metadata-$mode").toFile()
+                try {
+                    val queue=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,"queue.bin"),key,if(mode=="refused")1 else 1024*1024,
+                        com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,DurableReplace.DirSync{mode!="indeterminate"})
+                    val home=com.tracescout.mobile.queue.QueueHome.of(queue.backingFile()){queue}
+                    fields.getValue("config").set(TraceScoutMobile,TraceScoutMobile.Config("p","synthetic-test-key"))
+                    fields.getValue("bracket").set(TraceScoutMobile,com.tracescout.mobile.internal.queue.EvictionBracket(home))
+                    fields.getValue("authority").set(TraceScoutMobile,null)
+                    // A missing owner is disclosed by the real enqueue; this fixture
+                    // isolates the governed store's three durability answers.
+                    val record=Envelope.Record("frame-$mode","mobile_visual_frame",0,1,"{}".toByteArray())
+                    val completed=CountDownLatch(1);val outcome=AtomicReference<Boolean>()
+                    val callback:(Boolean)->Unit={outcome.set(it);completed.countDown()}
+                    assertEquals(true,enqueue.invoke(TraceScoutMobile,record,callback))
+                    assertTrue(completed.await(5,TimeUnit.SECONDS))
+                    assertEquals(mode=="committed",outcome.get())
+                    assertEquals(if(mode=="refused")0 else 1,queue.readAll().records.size)
+                } finally {dir.deleteRecursively()}
+            }
+        } finally {TraceScoutMobile.awaitFrameUpload();fields.forEach{(n,f)->f.set(TraceScoutMobile,prior[n])}}
+    }
+
+    @Test fun belowSlopSamplesCannotRelaxGesturePrivacy() {
+        val safe=com.tracescout.mobile.capture.interaction.GestureLifecycle.SampleFacts("screen",false,false,true,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.TargetClass.SAFE,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED,100,100)
+        for(restricted in listOf(safe.copy(positionTreatment=com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.BLOCKED),
+            safe.copy(textEntryActive=true),safe.copy(screenNeverRecord=true),safe.copy(fromContentWindow=false),safe.copy(screenId="other"))) {
+            for(swipe in listOf(false,true)) {
+                val g=com.tracescout.mobile.capture.interaction.GestureLifecycle(10f)
+                fun sample(action:com.tracescout.mobile.capture.interaction.GestureLifecycle.Action,x:Float)=
+                    com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(action,0,x,1f,1000000,1)
+                val rows=ArrayList<com.tracescout.mobile.capture.interaction.GestureLifecycle.Persist>()
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,1f),safe)
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.MOVE,2f),restricted)
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,if(swipe)30f else 1f),safe)
+                if(restricted.authority()==safe.authority())assertEquals(if(swipe)2 else 1,rows.size)
+                assertTrue("transient restriction leaked positional gesture",rows.all{it.facts.positionTreatment!=com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED})
+            }
+        }
+    }
+
+    @Test fun unrestrictedGesturesAndSampleClocksRemainObservable() {
+        val facts=com.tracescout.mobile.capture.interaction.GestureLifecycle.SampleFacts("screen",false,false,true,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.TargetClass.SAFE,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED,100,100)
+        for(swipe in listOf(false,true)) {
+            val g=com.tracescout.mobile.capture.interaction.GestureLifecycle(10f)
+            val rows=ArrayList<com.tracescout.mobile.capture.interaction.GestureLifecycle.Persist>()
+            rows+=g.observe(com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,0,1f,1f,1000000,100),facts)
+            rows+=g.observe(com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,0,if(swipe)30f else 1f,1f,3000000,2100),facts)
+            assertEquals(if(swipe)2 else 1,rows.size)
+            assertEquals(if(swipe)listOf("begin","end")else listOf(null),rows.map{it.phase?.wire})
+            for(row in rows) {
+                val emission=(com.tracescout.mobile.capture.interaction.InteractionProducer.produce(row) as com.tracescout.mobile.capture.interaction.InteractionProducer.Result.Emit).emission
+                val record=Envelope.interaction(Envelope.SessionIdentity("p","s","a","test","1","1","app","screen"),0,com.tracescout.mobile.privacy.Posture(),emission,
+                    clock=object:Clock{override fun monotonicNanos()=999L;override fun wallMillis()=99999L})
+                val json=org.json.JSONObject(String(record.bytes))
+                assertEquals(row.sample.wallMillis,json.getLong("timestamp"))
+                assertEquals(row.sample.monotonicNanos,json.getLong("monotonicNanos"))
+            }
+        }
+    }
+
+    @Test fun actualHostGatePausedBeforeEmissionRejectsSessionReplacementTruthfully() {
+        fun field(name:String)=TraceScoutMobile::class.java.getDeclaredField(name).apply{isAccessible=true}
+        val names=listOf("identity","clock","hostInteractionsEnabled","interactionScreen")
+        val fields=names.associateWith{field(it)};val prior=fields.mapValues{it.value.get(TraceScoutMobile)}
+        val gate=CountDownLatch(1);val resume=CountDownLatch(1)
+        val result=AtomicReference<HostInteraction.Decision>()
+        var worker:Thread?=null
+        try {
+            val a=Envelope.SessionIdentity("p","session-a","anonymous","test","1","1","app","screen")
+            fields.getValue("identity").set(TraceScoutMobile,a)
+            fields.getValue("hostInteractionsEnabled").setBoolean(TraceScoutMobile,true)
+            fields.getValue("interactionScreen").set(TraceScoutMobile,"screen")
+            fields.getValue("clock").set(TraceScoutMobile,object:Clock {
+                override fun monotonicNanos():Long {gate.countDown();check(resume.await(5,TimeUnit.SECONDS));return 1}
+                override fun wallMillis():Long=1
+            })
+            worker=Thread{result.set(TraceScoutMobile.recordHostInteraction("tap"))};worker.start()
+            assertTrue(gate.await(5,TimeUnit.SECONDS))
+            val ownerLock=field("identityWriteLock").get(TraceScoutMobile)
+            (ownerLock as java.util.concurrent.locks.ReentrantLock).withLock{fields.getValue("identity").set(TraceScoutMobile,a.copy(sessionId="session-b"))}
+            resume.countDown();worker.join(5000);assertFalse(worker.isAlive)
+            assertEquals(HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION),result.get())
+            assertEquals("session-b",(fields.getValue("identity").get(TraceScoutMobile) as Envelope.SessionIdentity).sessionId)
+        } finally {
+            resume.countDown();worker?.join(5000)
+            fields.forEach{(name,f)->f.set(TraceScoutMobile,prior[name])}
+        }
+    }
+
+    /** First start publishes the authority before `config`. A producer in that
+     * window holds a real sequence while `enqueue` schedules nothing: the host
+     * must not be told `Recorded`, and a refused navigation must not move the route. */
+    @Test fun allocatedSequenceWithoutScheduledAppendIsRefusedAndLeavesRouteUnchanged() {
+        fun field(name:String)=TraceScoutMobile::class.java.getDeclaredField(name).apply{isAccessible=true}
+        val names=listOf("identity","hostInteractionsEnabled","interactionScreen","authority","config")
+        val fields=names.associateWith{field(it)};val prior=fields.mapValues{it.value.get(TraceScoutMobile)}
+        val dir=java.nio.file.Files.createTempDirectory("pr3-admission").toFile()
+        val sid="ts_1700000000000_cccccccccccc"
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        try {
+            LossAuthority.closeAll()
+            val h=(LossAuthority.open(dir,sid,null,{key},DurableReplace.DirSync{true}) as LossAuthority.Open.Ok).handle
+            val a=Envelope.SessionIdentity("p",sid,"anonymous","test","1","1","app","screen")
+            fields.getValue("identity").set(TraceScoutMobile,a)
+            fields.getValue("hostInteractionsEnabled").setBoolean(TraceScoutMobile,true)
+            fields.getValue("interactionScreen").set(TraceScoutMobile,"screen")
+            fields.getValue("authority").set(TraceScoutMobile,h)
+            fields.getValue("config").set(TraceScoutMobile,null)
+            assertEquals(TraceScoutMobile.SessionEndEmission.REFUSED, TraceScoutMobile.recordSessionEnd())
+            assertEquals("a refused append must release its end claim", TraceScoutMobile.SessionEndEmission.REFUSED,
+                TraceScoutMobile.recordSessionEnd())
+            val before=h.unsettledSequences().size
+            assertEquals(HostInteraction.Decision.Refused(HostInteraction.REFUSED_INTERNAL_ERROR),
+                TraceScoutMobile.recordHostInteraction("tap"))
+            assertEquals("ARRANGE: a real sequence was allocated, so the old sequence test would say SUBMITTED",
+                before+1,h.unsettledSequences().size)
+            assertFalse(TraceScoutMobile.recordNavigation("next"))
+            assertEquals("screen",fields.getValue("interactionScreen").get(TraceScoutMobile))
+        } finally {
+            fields.forEach{(name,f)->f.set(TraceScoutMobile,prior[name])}
+            LossAuthority.closeAll();dir.deleteRecursively()
+        }
+    }
+}

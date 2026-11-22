@@ -1,0 +1,51 @@
+// A reproducible host application toolchain; the published library still uses
+// its consumer's toolchain. No React runtime or emulator is claimed here.
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20'
+    }
+}
+repositories { mavenCentral() }
+configurations { probeCompiler }
+dependencies {
+    probeCompiler 'org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.20'
+    probeCompiler 'org.jetbrains.kotlin:kotlin-stdlib:2.1.20'
+}
+tasks.register('probeCompiler', Sync) {
+    from configurations.probeCompiler
+    into layout.buildDirectory.dir('probe-compiler')
+}
+def stagedTests = layout.buildDirectory.dir('native-tests')
+tasks.register('stageNativeTests', Sync) {
+    from('../../tests') {
+        include 'Pr3PipelineRegressionTest.kt', 'Pr3HostBoundaryTest.kt', 'Pr3InteractionAdmissionTest.kt'
+        if (System.getenv('RECOVERY_TEST_ENDPOINT')) include 'CommittedRecoveryIntegrationTest.kt'
+    }
+    into stagedTests
+}
+ext.compileSdkVersion = 35
+subprojects {
+    configurations.configureEach {
+        resolutionStrategy.eachDependency { d ->
+            if (d.requested.group == 'com.facebook.react' && !d.requested.version) {
+                d.useVersion '0.88.1'
+            }
+        }
+    }
+    afterEvaluate {
+        android.sourceSets.test.java.setSrcDirs([stagedTests.get().asFile])
+        android.testOptions.unitTests.returnDefaultValues = true
+        dependencies {
+            testImplementation 'junit:junit:4.13.2'
+            testImplementation 'org.json:json:20250107'
+        }
+        tasks.configureEach {
+            if (name == 'compileDebugUnitTestKotlin') dependsOn rootProject.tasks.named('stageNativeTests')
+        }
+        tasks.withType(Test).configureEach {
+            testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat 'full' }
+        }
+    }
+}

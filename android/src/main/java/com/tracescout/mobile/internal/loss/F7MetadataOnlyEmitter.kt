@@ -157,7 +157,28 @@ internal object F7MetadataOnlyEmitter {
         }
     }
 
-    internal fun decide(authority: LossAuthority.Handle?): Decision {
+    internal fun decide(
+        authority: LossAuthority.Handle?,
+        /**
+ * **TRUE = "RE-SEND AN EXISTING FROZEN CLAIM OR SAY NOTHING". It is
+ * the STRUCTURAL guarantee that a caller cannot mint a fresh advance.**
+ *
+ * F-15's reconciliation needs exactly one of the two things this function
+ * can do — the by-value re-send of a claim that is ALREADY durable — and
+ * must never reach the other. A caller could try to establish that by
+ * reading `pendingCheckpoint` itself first, but between its read and
+ * this function's read the claim can settle, and then the fall-through
+ * would write an `advance` claim nobody authorised. So the PRECONDITION
+ * IS STATED HERE AND ENFORCED HERE, below the pending branch and above
+ * `projectLedger`: with this flag set, `MetadataOnlyCarrier.advance`,
+ * `MetadataOnlyCarrier.finality` and `requestCheckpoint` are all
+ * unreachable, rather than merely not reached.
+ *
+ * DEFAULT FALSE, so R-2's finalization trigger is byte-unchanged: the
+ * same single read, the same branches, the same `Omit` vocabulary.
+ */
+        pendingOnly: Boolean = false,
+    ): Decision {
         val h = authority ?: return Decision.Omit("no_authority")
 
         val disabled = try {
@@ -214,18 +235,69 @@ internal object F7MetadataOnlyEmitter {
             } catch (t: Throwable) {
                 return omit("pending_not_rederivable", t.javaClass.simpleName)
             }
-            // DISCLOSED LIMITATION, NOT A DEFECT WE CAN CLOSE HERE: the durable
-            // pending row does NOT persist the checkpoint KIND, so this cannot
-            // tell a claim F7 created from one F6 created for a delivered chunk.
-            // Re-sending a DELIVERY-origin claim on this route is ARITHMETICALLY
-            // REFUSED by the server every time — the metadata-only gap is
-            // `through - previous` while a delivery claim's declared delta covers
-            // `[previous+1. first-1]`, and `last >= first` makes the former
-            // strictly larger — so it can never be mis-accounted, only refused.
-            // A kind field on the durable row is a format change and is NOT in
-            // Slice A's scope.
+            // **CORRECTION OF RECORD — THE SENTENCE THAT USED TO STAND HERE
+            // WAS MEASURABLY FALSE, AND F-15 IS WHAT IT COST.** It read:
+            // *"Re-sending a DELIVERY-origin claim on this route is
+            // ARITHMETICALLY REFUSED by the server every time."* an earlier change drove the
+            // DEPLOYED handler (api `29373282…`, generation 570) with exactly that
+            // shape and it answered **202 `older`** for a stale claim and **202
+            // `duplicate`** for the current one.
+            //
+            // The MECHANISM the sentence describes is right and is kept: the
+            // metadata-only gap is `through - previous`, a delivery claim's
+            // declared delta covers `[previous+1. first-1]`, and `last >= first`
+            // makes the former strictly larger. Its CONCLUSION was wrong because
+            // that formula is not the branch that answers. `assessV1Checkpoint`
+            // reaches the interval test only after two earlier ones:
+            //
+            // ```
+            // !prevObserved -> the BASELINE escape, NO gap check -> accepted
+            // inThrough <= prevThrough -> older / duplicate -> no gap check
+            // otherwise -> gap === delta -> the quoted formula
+            // ```
+            //
+            // And a DELIVERY claim's `throughSequence` is, by `LossLedger.freeze`,
+            // the LAST sequence of the chunk it rode. So for the F-15 shape — a
+            // crash-recovery batch delivered by the process that started AFTER the
+            // crash, carrying a claim frozen for the PREVIOUS chunk — the server
+            // has either committed that boundary already (`inThrough <=
+            // prevThrough`, so `duplicate`) or has never observed the session at
+            // all (`!prevObserved`, so the baseline escape). Neither evaluates the
+            // gap. The third branch is reachable only when an EARLIER claim
+            // committed and this one's chunk never did, which the removal-
+            // protection invariant is what prevents; that case is refused, not
+            // mis-accounted, and the caller is told.
+            //
+            // AND THE DURABLE `kind` FIELD IS **NOT NEEDED**, measured rather
+            // than assumed — which is why no format change rides with this:
+            //
+            // * the WIRE is kind-free. `PendingCheckpoint.wire` emits exactly
+            // five keys (`lossAccountingVersion`, `sessionId`, `counts`,
+            // `throughSequence`, `terminal`); `kind` and `firstSequence` are not
+            // among them, so the document this branch renders is IDENTICAL
+            // whichever kind is named above.
+            // * the SETTLEMENT is kind-free. `LossAuthority.Handle.settleCheckpoint`
+            // builds `CheckpointAckBinder.Pending(checkpointId, throughSequence,
+            // frozenCounts)` and `CheckpointAckBinder.Ack(.)` — neither carries
+            // a kind, and `bind` matches on session, state, protocol, version,
+            // boundary and canonical-equal counts. `PendingCheckpoint.matches`,
+            // which DOES compare `ack.kind == kind`, belongs to
+            // `LossLedger.acknowledge`, and a product decision ruled that path UNCALLED.
+            //
+            // So the pending row still does not persist the kind, and this branch
+            // still cannot tell an F7 claim from an F6 one — but nothing
+            // downstream of it can tell either, so the ambiguity costs nothing.
             return Decision.Emit(CheckpointClaim.render(doc), pending.checkpointId, retry = true)
         }
+
+        // **THE PRECONDITION, ENFORCED WHERE IT CAN BE TRUSTED.** Everything
+        // below this line can MINT a claim: `projectLedger` →
+        // `MetadataOnlyCarrier.advance`/`finality` → `requestCheckpoint`. A caller
+        // that asked only for the re-send above must not reach it, and must not be
+        // the thing that guarantees so — its own `pendingCheckpoint` read is a
+        // separate read that can go stale between the two. One line here makes the
+        // mint UNREACHABLE for that caller rather than merely not reached.
+        if (pendingOnly) return omit("no_pending_claim")
 
         val ledger = try {
             h.projectLedger()

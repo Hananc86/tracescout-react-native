@@ -63,6 +63,14 @@ object VisualFrameCapturer {
  */
         val maskRects: List<IntArray>,
         val blockRects: List<IntArray>,
+        /**
+ * The EXACT float the canvas was scaled by (1f = no downscale) and the
+ * encoder quality. Both ride `mobile_visual_frame.compression`; the
+ * server publishes `downscale` verbatim as the capture→frame mapping,
+ * so it must be the value drawn through, never a recomputed one.
+ */
+        val downscale: Float = 1f,
+        val quality: Int = 60,
     ) {
         override fun equals(other: Any?) = other is Frame && other.contentSha256 == contentSha256
         override fun hashCode() = contentSha256.hashCode()
@@ -214,6 +222,7 @@ object VisualFrameCapturer {
                 captureReason = captureReason,
                 maskedRegions = masked, blockedRegions = blocked,
                 maskRects = maskRects, blockRects = blockRects,
+                downscale = scale, quality = quality,
             ))
         } catch (t: Throwable) {
             return Result.Refused(Refusal("frame_capture_failed"))

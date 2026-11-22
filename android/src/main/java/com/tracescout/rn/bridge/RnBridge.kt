@@ -1,5 +1,8 @@
 package com.tracescout.rn.bridge
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 import com.tracescout.rn.RnEnvelope
 import java.util.concurrent.ConcurrentHashMap
 
@@ -43,9 +46,9 @@ class RnBridge(
  */
     private val identity: () -> RnEnvelope.Identity?,
     /**
- * The ONE creator. Only [startSession] calls it — the opener event and
- * session creation are a single act, so a session without an opener is
- * unrepresentable rather than merely discouraged.
+ * The candidate creator. Only [startSession] calls it; production must not
+ * expose the candidate through [identity] until [publishSession] runs after
+ * the durable opener.
  */
     private val beginSession: () -> RnEnvelope.Identity?,
     /** Whether a persisted configuration exists — types the refusal. */
@@ -132,6 +135,29 @@ class RnBridge(
  * once would keep riding events after the correlation was dropped.
  */
     private val webViewRef: (() -> RnEnvelope.WebViewRef?)? = null,
+    /**
+ * APPLY an already-VALIDATED identified user to the live session (G2).
+ *
+ * THE OWNER STORES; THIS CLASS ONLY DECIDES. [identity] is a supplier,
+ * so the session identity is held by whoever constructed this bridge, and
+ * the setter has to reach the same place. A second copy of the identity
+ * here would be the "one fact, two homes" failure the envelope's own
+ * `nodeJson` comment records paying for.
+ *
+ * IT RECEIVES ONLY AN ACCEPTED VALUE. [identify] runs
+ * [com.tracescout.rn.IdentityPolicy] FIRST and never calls this with a
+ * blank, over-long or absent candidate, so an owner cannot accidentally
+ * store something the server would discard. Returns false if the owner
+ * could not apply it (no live session by the time it ran), which surfaces
+ * as [Outcome.REFUSED] rather than a silent success.
+ *
+ * Absent = `identify` is NOT INTEGRATED in this application, and says so
+ * ([Outcome.NOT_INTEGRATED]) instead of quietly doing nothing.
+ */
+    private val applyUserId: ((String) -> Boolean)? = null,
+    private val identityAdmissionLock: ReentrantLock = ReentrantLock(),
+    /** Publish a candidate only after its opener is committed, under the shared identity lock. */
+    private val publishSession: ((RnEnvelope.Identity) -> Unit)? = null,
 ) {
 
     /** An already-redacted, encoded frame the native layer produced. */
@@ -205,6 +231,8 @@ class RnBridge(
  * Returns the assigned sequence, or -1 when the record was refused.
  */
         fun enqueue(build: (Long) -> ByteArray): Long
+        /** Success requires a COMMITTED opener, never merely indeterminate storage. */
+        fun enqueueOpener(build: (Long) -> ByteArray): Long = enqueue(build)
 
         /**
  * Report a SEMANTIC MOMENT at which uploading would be appropriate.
@@ -340,6 +368,75 @@ class RnBridge(
         return Outcome.RECORDED
     }
 
+    /**
+ * Name the IDENTIFIED USER for the live session (G2) — the producer half of
+ * `identify`.
+ *
+ * The envelope has declared a root `userId` all along and the deployed
+ * server learned to store it (api-web `3f40126f`, migration 181); no
+ * producer emitted one, so `sessions.user_id` was NULL for every mobile
+ * session and the dashboard's user search and Signed-up filter were dark
+ * for the whole family. This is the call that ends that.
+ *
+ * IT EMITS NO EVENT, and that is deliberate. The identity rides the
+ * envelope of events the session was going to send anyway, so naming a user
+ * costs no queue entry, no chunk and no drain. Minting a record here would
+ * also make the identity depend on that one record surviving, where
+ * stamping leaves the server free to take the highest sequence it ever sees.
+ *
+ * IT TAKES NO SESSION ARGUMENT. The identity applies to the session the
+ * [identity] supplier reports, exactly like `endSessionAuthoritatively` —
+ * so a JS caller cannot name a user on a session it is not running.
+ *
+ * A BLANK ARGUMENT IS REFUSED, NOT A SIGN-OUT. The server's merge is
+ * incoming-wins-if-higher-sequence over a non-null identity, so an envelope
+ * naming no user does not clear a stored one: sign-out is not expressible
+ * through this field at all. Clearing locally would make the device stop
+ * stamping while the server kept the old value, and the two would disagree
+ * with nothing saying so. [Outcome.INVALID_INPUT] is the honest answer.
+ *
+ * Idempotent in effect: naming the same user twice re-applies the same
+ * value. Never throws into the host app.
+ */
+    fun identify(userId: String?): Outcome {
+        if (!configured()) return Outcome.NOT_CONFIGURED
+        // `identity`, NEVER `beginSession` — for the same reason
+        // `endSessionAuthoritatively` uses it: a session minted because its own
+        // identify was the first caller would have no `mobile_session_start`,
+        // which the server refuses to originate.
+        if (identity() == null) return Outcome.NO_SESSION
+        val apply = applyUserId ?: return Outcome.NOT_INTEGRATED
+        // ONE validation home. The decision carries a length and a verdict and
+        // deliberately NOT the value, so the trace below cannot leak an end
+        // user's key.
+        val decision = com.tracescout.rn.IdentityPolicy.classifyUserId(userId)
+        val accepted = decision.value
+        if (accepted == null) {
+            trace?.invoke(
+                "identify refused verdict=${decision.verdict.wire} " +
+                    "len=${decision.length ?: -1} max=${com.tracescout.rn.IdentityPolicy.USER_ID_MAX}",
+            )
+            return Outcome.INVALID_INPUT
+        }
+        val applied = try {
+            identityAdmissionLock.withLock { apply(accepted) }
+        } catch (_: Throwable) {
+            // The owner is documented never to throw; if it does, the host app
+            // still must not. A failure to apply is never a silent RECORDED.
+            false
+        }
+        trace?.invoke("identify applied=$applied len=${decision.length}")
+        // NO_SESSION, NOT REFUSED — and the Swift twin returns the SAME
+        // outcome for the SAME reason. The owner can only fail to apply an
+        // already-ACCEPTED value because the session went away between the
+        // guard above and this line, which is a race and exactly what
+        // NO_SESSION already names. REFUSED is documented as "the durable path
+        // refused the record", and nothing durable is written here. (The Swift
+        // enum has no REFUSED at all, so using it would also have made the two
+        // twins answer one situation with two different words.)
+        return if (applied) Outcome.RECORDED else Outcome.NO_SESSION
+    }
+
     /** Whether a route is currently declared never-record. No wire effect. */
     fun isNeverRecord(routeId: String): Boolean = routeId in neverRecordRoutes
 
@@ -386,29 +483,10 @@ class RnBridge(
     // ---------------------------------------------------------------- emission
 
     /** The first event of a session. Carries sequence 0 when the store is fresh. */
-    fun startSession(initialRouteId: String?): Result {
-        if (initialRouteId != null && !isSafeId(initialRouteId)) {
-            return Result(Outcome.INVALID_INPUT)
-        }
-        // The opener is the ONLY event allowed to create the session — one
-        // act, so a session without a `mobile_session_start` cannot exist.
+    fun startSession(initialRouteId: String?): Result = identityAdmissionLock.withLock {
+        if (initialRouteId != null && !isSafeId(initialRouteId)) return Result(Outcome.INVALID_INPUT)
         val id = beginSession() ?: return Result(Outcome.NOT_CONFIGURED)
-        lastFrameWallMs = -1; framesThisSession = 0
-        screenWebContent.keys.toList().forEach { screenWebContent.remove(it) }
-        if (initialRouteId != null) currentRoute = initialRouteId
-        // A new session invalidates hosts AND attempts from the previous one.
-        routeHosts?.sessionChanged(identity()?.sessionId)
-        routeHosts?.routeChanged(initialRouteId)
-        // DRAINED, NOT `.clear`. A repo guard forbids `.clear` anywhere in
-        // this file and it is RIGHT to: `store.clear` on the durable queue is
-        // the exact call that destroyed captured records, and a reviewer
-        // scanning for it must not have to decide which `clear` is which. This
-        // is a local queue of in-flight attempts, but the guard is a blunt
-        // instrument on purpose — so drain it explicitly instead of weakening
-        // the guard to admit a "safe" case.
-        while (pendingOutcomes.poll() != null) { /* discard */ }
-        attachDeadline?.cancel()
-        return emitWith(id, "mobile_session_start", neverRecord = false) {
+        val result = emitWith(id, "mobile_session_start", neverRecord = false, opener = true) {
             buildMap {
                 // Schema-REQUIRED fields (mobile_session_start.schema.json).
                 // metadata_only is honest for RN v1; "manual" because the
@@ -425,6 +503,24 @@ class RnBridge(
                 }
             }
         }
+        if (result.outcome != Outcome.RECORDED) return result
+        publishSession?.invoke(id)
+        lastFrameWallMs = -1; framesThisSession = 0
+        screenWebContent.keys.toList().forEach { screenWebContent.remove(it) }
+        currentRoute = initialRouteId
+        // A new session invalidates hosts AND attempts from the previous one.
+        routeHosts?.sessionChanged(id.sessionId)
+        routeHosts?.routeChanged(initialRouteId)
+        // DRAINED, NOT `.clear`. A repo guard forbids `.clear` anywhere in
+        // this file and it is RIGHT to: `store.clear` on the durable queue is
+        // the exact call that destroyed captured records, and a reviewer
+        // scanning for it must not have to decide which `clear` is which. This
+        // is a local queue of in-flight attempts, but the guard is a blunt
+        // instrument on purpose — so drain it explicitly instead of weakening
+        // the guard to admit a "safe" case.
+        while (pendingOutcomes.poll() != null) { /* discard */ }
+        attachDeadline?.cancel()
+        result
     }
 
     /**
@@ -995,9 +1091,9 @@ class RnBridge(
         val wall = clock.wallMillis(); val mono = clock.monotonicNanos()
         val eventId = ids.newEventId()
         val posture = RnEnvelope.Posture(allowedViewCount = 0, screenNeverRecord = false)
-        sink.enqueue { assigned ->
+        enqueueCurrent(id) { current, assigned ->
             RnEnvelope.visualFrame(
-                id, eventId, assigned, wall, mono, posture, fr.visualFrameId, routeId,
+                current, eventId, assigned, wall, mono, posture, fr.visualFrameId, routeId,
                 fr.contentHash, fr.width, fr.height, fr.byteSize, fr.format, fr.quality, fr.downscale,
             ).toByteArray(Charsets.UTF_8)
         }
@@ -1008,7 +1104,7 @@ class RnBridge(
  * the size budget is DROPPED with the snapshot kept — a partial tree that
  * lies about its own count is worse than an honest metadata event.
  */
-    private fun emitHierarchy(routeId: String, capture: HierarchyCapture, snap: Result): Result {
+    private fun emitHierarchy(routeId: String, capture: HierarchyCapture, snap: Result): Result = identityAdmissionLock.withLock {
         val id = identity() ?: return snap
         val wall = clock.wallMillis()
         val mono = clock.monotonicNanos()
@@ -1039,9 +1135,9 @@ class RnBridge(
             capture.result, capture.durationMs, wv,
         )
         if (probe.toByteArray(Charsets.UTF_8).size > 65_536 - 512) return snap
-        sink.enqueue { assigned ->
+        enqueueCurrent(id) { current, assigned ->
             RnEnvelope.viewHierarchy(
-                id, eventId, assigned, wall, mono, posture, snapshotId, routeId,
+                current, eventId, assigned, wall, mono, posture, snapshotId, routeId,
                 capture.result, capture.durationMs, wv,
             ).toByteArray(Charsets.UTF_8)
         }
@@ -1162,7 +1258,7 @@ class RnBridge(
     ): Result {
         val id = identity()
             ?: return Result(if (configured()) Outcome.NO_SESSION else Outcome.NOT_CONFIGURED)
-        return emitWith(id, eventType, neverRecord, webView, extra)
+        return emitWith(id, eventType, neverRecord, webView, extra = extra)
     }
 
     /**
@@ -1183,11 +1279,20 @@ class RnBridge(
     /** Diagnostics/tests: the last observed web-content fact for a route. */
     fun observedScreenHoldsWebContent(routeId: String): Boolean? = screenWebContent[routeId]
 
+    private fun enqueueCurrent(expected: RnEnvelope.Identity, build: (RnEnvelope.Identity, Long) -> ByteArray): Long =
+        identityAdmissionLock.withLock {
+            val current = identity() ?: return@withLock -1L
+            if (current.sessionId != expected.sessionId || current.projectId != expected.projectId)
+                return@withLock -1L
+            sink.enqueue { sequence -> build(current, sequence) }
+        }
+
     private fun emitWith(
         id: RnEnvelope.Identity,
         eventType: String,
         neverRecord: Boolean,
         webView: (() -> RnEnvelope.WebViewRef?)? = null,
+        opener: Boolean = false,
         extra: () -> Map<String, Any?>,
     ): Result {
         val body = extra()
@@ -1209,9 +1314,9 @@ class RnBridge(
         // session's carrier by default.
         val webViewRef = webView
         val wv = webViewRef?.invoke()
-        val seq = sink.enqueue { assigned ->
+        val build: (RnEnvelope.Identity, Long) -> ByteArray = { current, assigned ->
             RnEnvelope.envelope(
-                id = id,
+                id = current,
                 eventId = eventId,
                 eventType = eventType,
                 // The assigned value, not a local counter. This is the whole
@@ -1228,6 +1333,7 @@ class RnBridge(
                 webView = wv,
             ).toByteArray(Charsets.UTF_8)
         }
+        val seq = if (opener) sink.enqueueOpener { build(id, it) } else enqueueCurrent(id, build)
         return if (seq < 0) Result(Outcome.REFUSED)
         else Result(Outcome.RECORDED, seq, neverRecord)
     }

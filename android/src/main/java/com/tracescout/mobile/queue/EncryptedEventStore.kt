@@ -449,7 +449,23 @@ class EncryptedEventStore(
         // seal this replaced — pinned against a pre-extraction fixture file.
         val frame = GcmFrame.seal(key, plaintext, GcmFrame.NO_AAD, random)
 
-        if (file.exists() && file.length() + frame.size > maxBytes) {
+        // THE CAPACITY BOUND IS CONSULTED FOR EVERY APPEND, INCLUDING THE FIRST.
+        // This read `file.exists && file.length + frame.size > maxBytes`, and
+        // `java.io.File.length` ALREADY RETURNS 0 for a file that does not exist —
+        // so the `exists` conjunct contributed nothing to the arithmetic and only
+        // skipped the whole bound while the queue file was absent. A fresh store (or
+        // any store after a successful `clear`, which deletes the file) therefore
+        // accepted a first record bounded only by `MAX_FRAME_BYTES` — 4 MiB — while
+        // this class's own contract says "At capacity this store REFUSES, whatever
+        // the policy says". The gap is reachable: `RnFrameLossStore` configures
+        // 65_536, so a first record between 64 KiB and 4 MiB overshot its configured
+        // ceiling by up to 64x. Removing the conjunct is behaviour-preserving for
+        // every record that FITS (0 + size > max is false exactly when it fits) and
+        // routes the overshoot into the existing refusal below: on an absent file the
+        // left term is 0, so `frame.size > maxBytes` holds whenever the guard trips
+        // and the reason can only be `record_exceeds_capacity` — which is the honest
+        // one, since an empty store has no victim set that could make room.
+        if (file.length() + frame.size > maxBytes) {
             // REFUSE, NEVER EVICT — FOR EVERY POLICY (F4-P0 Slice C). The
             // implicit `evictOldest` that used to run here was a second
             // destructive writer with no durable intent and no attribution;

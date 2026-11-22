@@ -838,6 +838,30 @@ public object LossAuthority {
     @JvmStatic
     public fun evictionIntentId(bracketId: String, sequence: Long): String = "$bracketId-ev-$sequence"
 
+    /** Immutable project evidence, learned ONLY from explicitly owned queue records.
+     * Digests only, inside the authority directory so existing erasure/pruning owns
+     * its lifecycle. Missing/corrupt/foreign binding refuses chunkless disclosure.
+     * This sidecar never changes the frozen loss snapshot or settlement state. */
+    internal fun projectOwnership(filesDir: File, sid: String, project: String, bind: Boolean): Boolean =
+        synchronized(handles) {
+            if (project.isBlank()) return@synchronized false
+            val dir = EncryptedAuthorityStore.dirFor(filesDir, sid) ?: return@synchronized false
+            if (!dir.isDirectory) return@synchronized false
+            val lock = AuthorityLock.acquire(EncryptedAuthorityStore.rootFor(filesDir))
+            if (lock !is AuthorityLock.Acquisition.Ok) return@synchronized false
+            try {
+                if (EncryptedAuthorityStore.isPruned(dir)) return@synchronized false
+                val file = File(dir, "project-owner-v1.digest")
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(("project-owner-v1\u0000" + sid + "\u0000" + project).toByteArray(Charsets.UTF_8))
+                    .joinToString("") { "%02x".format(it) }
+                if (file.exists()) return@synchronized file.readText(Charsets.UTF_8) == digest
+                if (!bind) return@synchronized false
+                val result = DurableReplace.replace(file, DurableReplace.platformDirSync) { it.write(digest.toByteArray(Charsets.UTF_8)) }
+                result == DurableReplace.Outcome.COMMITTED && file.readText(Charsets.UTF_8) == digest
+            } catch (_: Exception) { false } finally { lock.release() }
+        }
+
     private val handles = ConcurrentHashMap<String, Handle>()
     private fun keyOf(filesDir: File, sessionId: String) = filesDir.absolutePath + "|" + sessionId
 
@@ -1459,6 +1483,30 @@ public object LossAuthority {
     public fun scanSessionIndexesAtOpen(filesDir: File): IndexScan =
         scanSessionIndexes(filesDir, { AuthorityKeys.authorityKey() })
 
+    /** Pending checkpoints survive empty queues. Unknown filesystem/key state
+     * retains the worker obligation rather than reporting an empty install. */
+    public fun hasPendingRecovery(filesDir: File): Boolean {
+        val root = EncryptedAuthorityStore.rootFor(filesDir)
+        val attributes = try {
+            java.nio.file.Files.readAttributes(root.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+        } catch (_: java.nio.file.NoSuchFileException) { return false }
+          catch (_: Throwable) { return true }
+        if (!attributes.isDirectory) return true
+        return try {
+            val dirs = root.listFiles() ?: return true
+            dirs.any { dir ->
+                val sid = AuthorityNaming.decodeSessionDirName(dir.name)
+                if (sid == null) dir.isDirectory
+                else if (!dir.isDirectory) true
+                else if (EncryptedAuthorityStore.isPruned(dir)) false
+                else when (val opened = openExisting(filesDir, sid)) {
+                    is Open.Unavailable -> true
+                    is Open.Ok -> opened.handle.pendingCheckpoint() != null
+                }
+            }
+        } catch (_: Throwable) { true }
+    }
+
     /**
  * **F7 R-2 CROSS-LAUNCH — the session ids that have a LIVE authority
  * directory on disk, other than [exclude].** A NAME LIST ONLY: it opens
@@ -1491,25 +1539,25 @@ public object LossAuthority {
  * directory whose name does not decode is skipped rather than approximated.
  */
     public fun sessionIdsOnDisk(filesDir: File, exclude: String): List<String> = try {
-        val root = EncryptedAuthorityStore.rootFor(filesDir)
-        if (!root.isDirectory) emptyList()
-        else {
-            // ONE PREDICATE, ONE EXCLUSION, ONE LISTING. The first version
-            // counted with this predicate and then filtered with it again, and
-            // excluded the caller's own session TWICE — once by directory name
-            // here and once by decoded id afterwards. A negative control said
-            // NOT CAUGHT and was right about the code, not about the suite:
-            // with two exclusions neither is load-bearing, so neither can be
-            // shown to matter. Now removing this one reddens `R2-12`.
-            val mine = EncryptedAuthorityStore.dirFor(filesDir, exclude)?.name
-            (root.listFiles() ?: emptyArray())
-                .filter { it.isDirectory && !EncryptedAuthorityStore.isPruned(it) && it.name != mine }
-                .sortedBy { it.name }
-                .mapNotNull { AuthorityNaming.decodeSessionDirName(it.name) }
-        }
+        sessionIdsOnDiskOrThrow(filesDir, exclude)
     } catch (t: Throwable) {
         RecoveryTrace.log("authority_dir_list_failed", "why" to t.javaClass.simpleName)
         emptyList()
+    }
+
+    /** Recovery must distinguish a missing root from an unreadable listing. */
+    public fun sessionIdsOnDiskOrThrow(filesDir: File, exclude: String): List<String> {
+        val root = EncryptedAuthorityStore.rootFor(filesDir)
+        val attributes = try {
+            java.nio.file.Files.readAttributes(root.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+        } catch (_: java.nio.file.NoSuchFileException) { return emptyList() }
+        if (!attributes.isDirectory) throw java.io.IOException("authority_root_not_directory")
+        val mine = EncryptedAuthorityStore.dirFor(filesDir, exclude)?.name
+        val dirs = root.listFiles() ?: throw java.io.IOException("authority_listing_unreadable")
+        return dirs.filter {
+            val child = java.nio.file.Files.readAttributes(it.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+            child.isDirectory && !EncryptedAuthorityStore.isPruned(it) && it.name != mine
+        }.sortedBy { it.name }.mapNotNull { AuthorityNaming.decodeSessionDirName(it.name) }
     }
 
     /**
