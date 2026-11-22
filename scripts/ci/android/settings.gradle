@@ -1,0 +1,6 @@
+dependencyResolutionManagement {
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = 'rn-host-regressions'
+include ':tracescout'
+project(':tracescout').projectDir = file('../../../android')

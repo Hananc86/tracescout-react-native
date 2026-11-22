@@ -6,3 +6,6 @@ android/.cxx/
 ios/build/
 .DS_Store
 __pycache__/
+scripts/ci/android/.gradle/
+scripts/ci/android/build/
+ci-results/

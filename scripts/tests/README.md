@@ -48,3 +48,35 @@ no-new-events settlement. No deployed runtime or iOS package proof is implied.
 The explicit candidate wire addendum is owned by the API repository:
 `docs/mobile/COMMITTED_EVENT_LOSS_RECOVERY.md`. It preserves the original frozen
 claim and requires committed event coverage; it does not cancel or rebase it.
+
+## Pull request CI
+
+`.github/workflows/pr-tests.yml` checks out the exact PR head with read-only
+permissions. It neither runs the separate publication workflow nor publishes.
+
+The host Gradle project in `scripts/ci/android` pins Gradle 8.14.3 (installed by
+CI), AGP 8.7.3, Kotlin 2.1.20, React Android 0.88.1, Java 17 and compile SDK 35.
+From a clean checkout with Java 17, that Gradle version, and Android SDK
+platform 35 / build-tools 34.0.0 installed (`ANDROID_HOME` set), run:
+
+```sh
+gradle -p scripts/ci/android :tracescout:testDebugUnitTest probeCompiler --no-daemon
+python3 scripts/ci/check-junit.py
+python3 scripts/ci/kotlin-controls.py
+```
+
+Only the three `Pr3*Test` classes are staged into the host test source set.
+The JUnit verifier derives their test names from committed source, requires every
+case to execute without errors/failures/skips, and prints actual per-suite counts.
+The Kotlin probe runs with the pinned compiler dependencies, then compiles and
+executes a deliberately stale-identity variant; only its specific runtime
+assertion failure counts as the negative control. Missing dependencies or compile
+failures cannot satisfy it. CI retains JUnit XML, reports, probe logs and the
+checked-out SHA. `CommittedRecoveryIntegrationTest` is deliberately outside this
+offline job; it still needs the real isolated server/database described above.
+
+The package job uses the committed npm lock and `npm ci --legacy-peer-deps
+--ignore-scripts`, followed by explicit typecheck/build/surface/packed-file checks.
+React Native 0.88.1 is a pinned development dependency for its real type declarations; no React Native application is launched. The Swift job uses the Linux
+Swift 6.0.3 image and the portable probe above; it proves transport interleavings,
+not Apple SDK compilation, CocoaPods integration, rendering or device execution.
