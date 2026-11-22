@@ -40,13 +40,17 @@ class Pr3HostBoundaryTest {
                     }
                     override fun monotonicNanos()=1L
                 }, ids=object:com.tracescout.rn.bridge.RnBridge.EventIdSource {override fun newEventId()="evt_test_identity"})
-            val thread=Thread({bridge.lifecycle("foreground")},"paused-capture")
+            val failure=java.util.concurrent.atomic.AtomicReference<Throwable>()
+            val result=java.util.concurrent.atomic.AtomicReference<com.tracescout.rn.bridge.RnBridge.Result>()
+            val thread=Thread({try{result.set(bridge.lifecycle("foreground"))}catch(t:Throwable){failure.set(t)}},"paused-capture")
             try {
                 thread.start();assertTrue(read.await(5,java.util.concurrent.TimeUnit.SECONDS))
                 assertEquals(com.tracescout.rn.bridge.RnBridge.Outcome.RECORDED,bridge.identify("new"))
                 if(replaceSession) lock.withLock{live.set(live.get().copy(sessionId="replacement"))}
                 bridge.lifecycle("background")
                 resume.countDown();thread.join(5000);assertFalse(thread.isAlive)
+                assertNull("capture thread threw instead of returning its outcome",failure.get())
+                assertEquals(if(replaceSession) com.tracescout.rn.bridge.RnBridge.Outcome.REFUSED else com.tracescout.rn.bridge.RnBridge.Outcome.RECORDED,result.get().outcome)
                 assertEquals(if(replaceSession) 1 else 2,output.size)
                 assertTrue(output.all{org.json.JSONObject(it).getString("userId")=="new"})
             } finally {resume.countDown();thread.join(5000)}

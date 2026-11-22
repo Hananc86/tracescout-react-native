@@ -299,12 +299,20 @@ class Pr3PipelineRegressionTest {
 
     @Test fun nativeDrainOutcomeBelongsToItsInvocation() = checkpointOnlyDrain(true, true)
 
-    private fun checkpointOnlyDrain(native:Boolean, interleave:Boolean=false) {
-        val f=tmp();val h=strand(f,0,6,8)
+    @Test fun nativeForegroundFinalEventStillSchedulesCheckpointRetry() = checkpointOnlyDrain(true, foreground=true)
+
+    private fun checkpointOnlyDrain(native:Boolean, interleave:Boolean=false, foreground:Boolean=false) {
+        val f=tmp();val h=if(foreground)strand(f,0,0,0)else strand(f,0,6,8)
         assertTrue(realSink(f).projectOwnership(sid,"p",true))
         val q=EncryptedEventStore(File(f,if(native) com.tracescout.mobile.queue.QueueKeyStores.SDK_QUEUE else com.tracescout.mobile.queue.QueueKeyStores.RN_QUEUE),k,
             4L*1024*1024,EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,yes)
         QueueHome.of(q.backingFile()){q}
+        if(foreground) {
+            q.append(owned(0))
+            // Native recovery uses the real reader; supply the fixture key at
+            // authority open, just as a configured producer does before admission.
+            assertTrue(LossAuthority.open(f,sid,LossAuthority.QueueSnapshot(q.readAll().records,true),{k},yes) is LossAuthority.Open.Ok)
+        }
         val transport:Any=if(native) com.tracescout.mobile.TraceScoutMobile else com.tracescout.mobile.rn.RnTransport
         fun field(name:String)=transport.javaClass.getDeclaredField(name).apply{isAccessible=true}
         val fields=(if(native) listOf("store","config","home","uploader","appContext","identity")
@@ -320,18 +328,25 @@ class Pr3PipelineRegressionTest {
         server.soTimeout=5000
         val serverError=java.util.concurrent.atomic.AtomicReference<Throwable>()
         val serving=Thread {
-            try { server.accept().use { client ->
+            try { repeat(if(foreground)2 else 1) { request -> server.accept().use { client ->
                 client.soTimeout=5000
                 val input=client.getInputStream()
                 val header=StringBuilder()
                 while(!header.endsWith("\r\n\r\n")) {val c=input.read();check(c>=0);header.append(c.toChar())}
                 val length=Regex("(?i)Content-Length: ([0-9]+)").find(header)!!.groupValues[1].toInt()
-                repeat(length){check(input.read()>=0)}
+                val body=ByteArray(length){input.read().also{check(it>=0)}.toByte()}
                 posts.incrementAndGet()
+                val reply=if(foreground && request==0) {
+                    val doc=org.json.JSONObject(String(body));val chunk=doc.getString("chunkId")
+                    org.json.JSONObject().put("ack",org.json.JSONObject().put("version","mobile-ack-1").put("state","accepted")
+                        .put("sessionId",sid).put("chunkId",chunk).put("firstSequence","0").put("lastSequence","0")
+                        .put("recordCount",1).put("contentSha256","0".repeat(64))).toString()
+                } else "{}"
+                val status=if(foreground && request==0)"202 Accepted" else "503 Service Unavailable"
                 client.getOutputStream().apply {
-                    write("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".toByteArray());flush()
+                    write("HTTP/1.1 $status\r\nContent-Length: ${reply.toByteArray().size}\r\nConnection: close\r\n\r\n$reply".toByteArray());flush()
                 }
-            } } catch(t:Throwable){serverError.set(t)}
+            } } } catch(t:Throwable){serverError.set(t)}
         }
         serving.start()
         try {
@@ -344,7 +359,12 @@ class Pr3PipelineRegressionTest {
                 fields.getValue("appContext").set(transport,context)
                 fields.getValue("identity").set(transport,null)
                 transport.javaClass.getDeclaredMethod("installWorkerDrain").apply{isAccessible=true}.invoke(transport)
-                if (!interleave) {
+                if (foreground) {
+                    transport.javaClass.getDeclaredMethod("recoverInherited",android.content.Context::class.java).apply{isAccessible=true}.invoke(transport,context)
+                    com.tracescout.mobile.TraceScoutMobile.awaitFrameUpload()
+                    assertEquals(com.tracescout.mobile.queue.RecoveryCoordinator.Status.RECOVERY_RETRIABLE_FAILURE,
+                        com.tracescout.mobile.queue.RecoveryCoordinator.status)
+                } else if (!interleave) {
                     assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,
                         com.tracescout.mobile.queue.RecoveryWorker.drainHook!!(context))
                 } else {
@@ -373,7 +393,7 @@ class Pr3PipelineRegressionTest {
                 assertEquals(com.tracescout.mobile.rn.RnTransport.State.PENDING_NETWORK,
                     com.tracescout.mobile.rn.RnTransport.drainConfigured(context,cfg))
             }
-            serving.join(6000);assertNull(serverError.get());assertEquals(1,posts.get());assertNotNull(h.pendingCheckpoint());assertTrue(q.readAll().records.isEmpty())
+            serving.join(6000);assertNull(serverError.get());assertEquals(if(foreground)2 else 1,posts.get());assertNotNull(h.pendingCheckpoint());assertTrue(q.readAll().records.isEmpty())
         } finally {
             server.close();serving.join(6000);fields.forEach{(name,field)->field.set(transport,prior[name])}
             com.tracescout.mobile.queue.RecoveryCoordinator.release(context)

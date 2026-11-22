@@ -79,3 +79,32 @@ precondition(ExceptionPrivacyProbe.safeExceptionType("NSRangeException") == "NSR
 precondition(ExceptionPrivacyProbe.safeExceptionType("RCTFatalException") == "RCTFatalException")
 print("PASS actual Swift exception policy excludes arbitrary names and preserves exact known identifiers")
 ''')
+
+# Compile the actual budget predicate and actual identity bound. Exercise growth
+# using the production JSON string encoder, not a duplicated byte-count formula.
+s=(r/'ios/TraceScoutRN/RnBridge.swift').read_text()
+budget=block('private static func hierarchyProbeFits(').replace('private static','static')
+import re
+identity=(r/'ios/TraceScoutRN/IdentityPolicy.swift').read_text()
+limit=re.search(r'public static let userIdMax = [0-9]+',identity).group()
+print('enum IdentityPolicy { '+limit+' }\nenum BudgetProbe {\n'+budget+'\n}')
+s=(r/'ios/TraceScoutRN/RnEnvelope.swift').read_text()
+print('enum WireEscaping {\n'+block('static func str(')+'\n}')
+print(r'''for payloadSize in [63000, 65000] {
+    let anonymous = "{\"payload\":" + WireEscaping.str(String(repeating: "x", count: payloadSize)) + "}"
+    let probe = Data(anonymous.utf8)
+    for user in [String(repeating: "\u{0001}", count: IdentityPolicy.userIdMax), String(repeating: "😀", count: IdentityPolicy.userIdMax)] {
+        let current = String(anonymous.dropLast()) + ",\"userId\":" + WireEscaping.str(user) + "}"
+        let actual = Data(current.utf8)
+        _ = try! JSONSerialization.jsonObject(with: actual)
+        if BudgetProbe.hierarchyProbeFits(probe.count) {
+            precondition(actual.count <= 65536, "hierarchy identity growth exceeded budget")
+        }
+    }
+}
+precondition(BudgetProbe.hierarchyProbeFits(63000))
+print("PASS actual Swift hierarchy predicate bounds escaped and multi-byte identity growth")
+''')
+observer=(r/'ios/TraceScoutRN/RnIncidentObserver.swift').read_text()
+assert 'Thread.current.name' not in observer
+assert 'threadName: Thread.current.isMainThread ? "main" : "background"' in observer

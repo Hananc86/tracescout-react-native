@@ -1310,7 +1310,8 @@ object TraceScoutMobile {
                     // reset racing this queued worker task leaves exactly that
                     // window — and hardcoding `true` here reported a stale
                     // `auth_rejected` as RECOVERY_AUTH_REJECTED.
-                    val reached = uploadRaw(records)
+                    var disposition = DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
+                    val reached = uploadRawWithOutcome(records) { disposition = it }
                     // THE SAME DEFECT HAS A SECOND SITE, AND IT IS HERE.
                     // Found by reading this function, not by the finding that
                     // named the first one. After the upload this re-reads the
@@ -1328,7 +1329,7 @@ object TraceScoutMobile {
                     // `RecoveryWorker.enqueue` — the obligation is retained.
                     // Folding the classified case into it keeps ONE predicate
                     // and one meaning rather than inventing a second.
-                    val left = try {
+                    val left = if (!reached || disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) -1 else try {
                         s.readAll().let { if (it.couldNotBeRead) -1 else it.records.size }
                     } catch (_: Throwable) { -1 }
                     RecoveryCoordinator.status =
@@ -3118,7 +3119,13 @@ object TraceScoutMobile {
         try { openParkStore().status() }
         catch (_: Throwable) { com.tracescout.mobile.internal.queue.ParkStatus(0, 0, 0L) }
 
-    private fun uploadRaw(records: List<ByteArray>): Boolean = uploadRawWithOutcome(records) { }
+    private fun uploadRaw(records: List<ByteArray>): Boolean = uploadRawWithOutcome(records) { disposition ->
+        // Explicit flush/frame drains have no recovery caller to retain this
+        // obligation. Hand checkpoint retry to the existing bounded worker.
+        if (disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) {
+            appContext?.let { RecoveryWorker.enqueue(it) }
+        }
+    }
 
     // The result belongs to this invocation; concurrent drains cannot replace it.
     private fun uploadRawWithOutcome(records: List<ByteArray>, outcome: (DurableUploadPipeline.Disposition) -> Unit): Boolean {

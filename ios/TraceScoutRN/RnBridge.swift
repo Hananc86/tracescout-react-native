@@ -1501,6 +1501,13 @@ public final class RnBridge {
         }
     }
 
+    private static func hierarchyProbeFits(_ byteCount: Int) -> Bool {
+        // identify may refresh userId before admission. A JSON-escaped scalar
+        // needs at most six bytes; reserve the entire allowed identity growth.
+        // The existing margin also covers the field key and sequence digits.
+        byteCount <= 65_536 - 512 - IdentityPolicy.userIdMax * 6
+    }
+
     private func emitHierarchy(routeId: String, capture: HierarchyCapture,
                                after snap: Result) -> Result {
         guard let id = identity() else { return snap }
@@ -1526,7 +1533,7 @@ public final class RnBridge {
             timestampMillis: wall, monotonicNanos: mono, posture: posture,
             snapshotId: snapshotId, screenId: routeId,
             result: capture.result, captureDurationMs: capture.durationMs, webView: wv)
-        guard probe.utf8.count <= 65_536 - 512 else { return snap }
+        guard RnBridge.hierarchyProbeFits(probe.utf8.count) else { return snap }
         _ = sink.enqueue(expected: id) { assigned, id in
             Data(RnEnvelope.viewHierarchy(
                 id: id, eventId: eventId, sequence: assigned,

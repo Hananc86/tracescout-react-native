@@ -6,7 +6,7 @@ that retaining the old producer identity makes the interleaving test fail.
 """
 from pathlib import Path
 import argparse, subprocess, tempfile
-p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');p.add_argument('--mutate-frame',action='store_true');p.add_argument('--mutate-route',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');p.add_argument('--mutate-frame',action='store_true');p.add_argument('--mutate-route',action='store_true');p.add_argument('--mutate-flush',action='store_true');a=p.parse_args()
 r=Path(__file__).resolve().parents[2];out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
 def read(n):return (r/'android/src/main/java/com/tracescout/mobile'/n).read_text()
 def block(s,start):
@@ -15,12 +15,18 @@ def block(s,start):
  while depth:
   depth+=(s[j]=='{')-(s[j]=='}');j+=1
  return s[i:j]
+incident=read('rn/RnIncidentCapture.kt')
+assert 'threadName = thread.name' not in incident
+assert 'threadName = if (thread === Looper.getMainLooper().thread) "main" else "background"' in incident
+print('PASS automatic incident capture uses only fixed thread labels',flush=True)
 s=read('TraceScoutMobile.kt')
 start=s[s.index('beginTransportChange(TransportOwner.LIVE)'):s.index('endTransportChange()',s.index('beginTransportChange(TransportOwner.LIVE)'))]
 assert start.index('LossAuthority.open(')<start.index('val liveUploader = Uploader(')<start.index('config = cfg')<start.index('uploader = liveUploader')
 print('PASS source guard: throwing authority/reconciliation/uploader construction precedes config publication',flush=True)
 identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun').replace('noinline onSubmitted','onSubmitted')
 if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected, d)')
+flush=block(s,'private fun uploadRaw(records:').replace('private fun','fun')
+if a.mutate_flush:flush=flush.replace('disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED','false')
 route=block(s,'private fun publishCaptureRoute(').replace('private fun','fun')
 if a.mutate_route:route=route.replace('if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false','')
 frame=block(s,'if (frameAdmission != EnqueueAdmission.SUBMITTED)').replace('return@guard','return')
@@ -40,6 +46,8 @@ object Envelope {
 }
 object RecoveryTrace { fun log(vararg x:Any?) {} }
 class Context(val filesDir:File)
+object DurableUploadPipeline {enum class Disposition {EMPTY,F15_CHECKPOINT_RETRY_OWED}}
+object RecoveryWorker {var scheduled=0;fun enqueue(ctx:Context):Boolean {scheduled++;return true}}
 class Subject {
  enum class EnqueueAdmission { SUBMITTED, NO_SESSION, REFUSED }
  val identityWriteLock=Any()
@@ -52,7 +60,10 @@ class Subject {
  fun enqueue(r:Envelope.Record)=true
  fun identify(user:String)=synchronized(identityWriteLock){identity=identity?.copy(userId=user)}
  fun replace(id:Envelope.SessionIdentity?)=synchronized(identityWriteLock){identity=id}
-'''+identity+route+'''
+'''+identity+route+flush+'''
+ var appContext:Context?=Context(File("."))
+ var nextDisposition=DurableUploadPipeline.Disposition.EMPTY
+ fun uploadRawWithOutcome(records:List<ByteArray>,outcome:(DurableUploadPipeline.Disposition)->Unit):Boolean {outcome(nextDisposition);return true}
  var interactionScreen:String?=null
  var lastFrameRefusal:String?=null
  var frameUploads=0
@@ -113,6 +124,11 @@ fun main() {
  }
  check(s.frameAfterMetadata(Subject.EnqueueAdmission.SUBMITTED)=="frame");check(s.frameUploads==1)
  println("PASS frame bytes require submitted metadata")
+ s.nextDisposition=DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED
+ s.uploadRaw(emptyList());check(RecoveryWorker.scheduled==1){"flush dropped checkpoint retry"}
+ s.nextDisposition=DurableUploadPipeline.Disposition.EMPTY
+ s.uploadRaw(emptyList());check(RecoveryWorker.scheduled==1)
+ println("PASS ordinary flush retains checkpoint retry without scheduling completed drains")
  s.replace(initial)
  val attempted=CountDownLatch(1)
  val stale=Thread { attempted.countDown(); s.claimEnd() }

@@ -242,7 +242,7 @@ public enum RnIncidentObserver {
                 errorId: eventId,
                 crashClass: IncidentPolicy.iosCrashClass("nsexception"),
                 exceptionType: typeName,
-                threadName: Thread.current.isMainThread ? "main" : Thread.current.name,
+                threadName: Thread.current.isMainThread ? "main" : "background",
                 isMainThread: Thread.current.isMainThread,
                 frames: frames, screenId: screen).utf8)
         }

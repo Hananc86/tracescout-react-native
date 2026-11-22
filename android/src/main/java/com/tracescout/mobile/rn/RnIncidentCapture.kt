@@ -301,7 +301,7 @@ object RnIncidentCapture {
                 errorId = eventId,
                 crashClass = IncidentPolicy.androidCrashClass(throwable.javaClass.name),
                 exceptionType = throwable.javaClass.name,
-                threadName = thread.name,
+                threadName = if (thread === Looper.getMainLooper().thread) "main" else "background",
                 isMainThread = thread === Looper.getMainLooper().thread,
                 frames = frames,
                 screenId = eventScreen,
