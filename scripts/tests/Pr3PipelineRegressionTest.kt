@@ -229,6 +229,28 @@ class Pr3PipelineRegressionTest {
         assertEquals(listOf(true),boundAtPost)
         assertEquals(0,q.readAll().records.size)
     }
+    /** A torn inherited queue is not evidence of ownership: a sink that would
+     * adopt a lossy view must not be asked, and nothing is sent. */
+    @Test fun inheritedUntrustworthyQueueSendsNoPost() {
+        val f=tmp();val q=queue(f);for(seq in 0L..1L)q.append(owned(seq))
+        java.io.RandomAccessFile(q.backingFile(),"rw").use{it.seek(it.length());it.write(byteArrayOf(0,0,0,9,1,2))}
+        val read=q.readAll()
+        assertEquals("ARRANGE: both records still readable",2,read.records.size)
+        assertFalse("ARRANGE: the read is lossy","ok"==read.integrityClass)
+        assertFalse("ARRANGE: no authority exists",LossAuthority.authorityExists(f,sid))
+        var adoptions=0;val real=realSink(f)
+        // The sink the reviewer named: it answers Ready after a lossy view.
+        val lenient=object: AttributionSink by real {
+            override fun adoptForRemoval(sessionId:String, queue:List<ByteArray>, queueTrustworthy:Boolean):AttributionSink.Adoption {
+                adoptions++;return real.adoptForRemoval(sessionId,queue,true)
+            }
+        }
+        val bodies=ArrayList<String>();val p=pipelineWith(f,q,bodies,lenient){body -> chunkOk(body)}
+        p.upload(read.records,sid)
+        assertEquals("a lossy inherited queue sends nothing",0,bodies.size)
+        assertEquals("the lenient sink was never asked to adopt for the POST",0,adoptions)
+        assertEquals(2,q.readAll().records.size)
+    }
     /** Ownership that cannot be established before the POST still refuses, and
      * a refusal that sent nothing is not a POSTED attempt: once the binding is
      * possible the same queue image delivers instead of sitting behind the

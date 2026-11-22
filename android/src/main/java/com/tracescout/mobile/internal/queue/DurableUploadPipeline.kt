@@ -2684,6 +2684,14 @@ class DurableUploadPipeline(
             RecoveryTrace.log("pre_post_adoption_unreadable", "code" to t.javaClass.simpleName, "chunk" to chunkId.take(12))
             return false
         }
+        // DECIDED HERE, NOT DELEGATED. The integrity answer is also handed to the
+        // sink, but a sink may answer Ready after a lossy view — and a lossy
+        // view is not evidence of who owns these records. Refused before the
+        // sink is asked, so no authority is created from a damaged queue either.
+        if (!trustworthy) {
+            RecoveryTrace.log("pre_post_adoption_refused", "why" to "queue_untrustworthy", "chunk" to chunkId.take(12))
+            return false
+        }
         val a = attribution.adoptForRemoval(session, queue, trustworthy)
         RecoveryTrace.log("pre_post_adoption", "outcome" to a.javaClass.simpleName,
             "session" to session.take(24), "chunk" to chunkId.take(12))
