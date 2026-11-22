@@ -295,6 +295,9 @@ public interface AttributionSink {
  * implementers include test doubles that model the F2 seam — reports no claim
  * and therefore gates nothing, which is exactly today's behaviour.
  */
+    /** No ownership evidence is an explicit refusal, never the current credential by default. */
+    public fun projectOwnership(sessionId: String, projectId: String, bindFromRecords: Boolean = false): Boolean = false
+
     public fun f7PendingClaim(sessionId: String): PendingClaim = PendingClaim.None
 
     /**
@@ -686,6 +689,9 @@ public interface AttributionSink {
  * so `Unreadable` does not attempt one either — but it no longer
  * lets the DATA chunk through.
  */
+                override fun projectOwnership(sessionId: String, projectId: String, bindFromRecords: Boolean): Boolean =
+                    handle(sessionId) != null && LossAuthority.projectOwnership(filesDir, sessionId, projectId, bindFromRecords)
+
                 override fun f7PendingClaim(sessionId: String): PendingClaim = try {
                     val h = f6Handle(sessionId)
                     if (h == null) {

@@ -40,10 +40,10 @@ class InteractionCapture(
  * (S5, an earlier change) — `null` for an ordinary native touch, which is the
  * overwhelming majority and the default.
  */
-    private val sink: (InteractionProducer.Emission, com.tracescout.mobile.capture.WebViewAttachment.Carrier?) -> Unit,
+    private val sink: (InteractionProducer.Emission, com.tracescout.mobile.capture.WebViewAttachment.Carrier?, com.tracescout.mobile.emit.Envelope.SessionIdentity) -> Boolean,
     private val clockNanos: () -> Long = System::nanoTime,
     private val wallMillis: () -> Long = System::currentTimeMillis,
-    private val sessionIdProvider: () -> String? = { null },
+    private val identityProvider: () -> com.tracescout.mobile.emit.Envelope.SessionIdentity?,
 ) {
 
     /** Counters for a host-visible "why did nothing record". Never logs content. */
@@ -56,7 +56,7 @@ class InteractionCapture(
     // holds the wrapper strongly for as long as the Activity lives.
     private val installed = WeakHashMap<Activity, java.lang.ref.WeakReference<ObservingWindowCallback>>()
     private val lifecycles = WeakHashMap<Activity, GestureLifecycle>()
-    private val gestureSessions = WeakHashMap<Activity, String?>()
+    private val gestureSessions = WeakHashMap<Activity, Pair<String, String>>()
 
     /**
  * The carrier chosen at this gesture's DOWN, held for every phase of it.
@@ -158,6 +158,11 @@ class InteractionCapture(
         }
 
     internal fun onTouch(activity: Activity, ev: MotionEvent) {
+        val expected = identityProvider() ?: run {
+            lifecycles[activity]?.reset(); gestureCarrier.remove(activity); gestureSessions.remove(activity)
+            return
+        }
+
         // The permission gates the CREATION of telemetry — never the seam.
         if (!captureEnabled()) { lifecycles[activity]?.reset(); gestureCarrier.remove(activity); return }
         val action = when (ev.actionMasked) {
@@ -187,7 +192,7 @@ class InteractionCapture(
         )
         // Gated at the hit-test fact of the gesture's DOWN, then HELD. The
         // registry is never asked for a gesture that began outside web content.
-        val session = sessionIdProvider()
+        val session = expected.projectId to expected.sessionId
         if (action != GestureLifecycle.Action.DOWN && gestureSessions[activity] != session) {
             lifecycles[activity]?.reset()
             gestureCarrier.remove(activity)
@@ -197,14 +202,14 @@ class InteractionCapture(
         if (action == GestureLifecycle.Action.DOWN) {
             gestureSessions[activity] = session
             gestureCarrier[activity] = carrierFor(target.webView != null) {
-                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(target.webView, session)
+                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(target.webView, expected.sessionId)
             }()
         }
         val carrier = gestureCarrier[activity]
         val emissions = lifecycleFor(activity).observe(sample, facts)
         for (p in emissions) {
             when (val r = InteractionProducer.produce(p)) {
-                is InteractionProducer.Result.Emit -> { sink(r.emission, carrier); emitted++ }
+                is InteractionProducer.Result.Emit -> { if (sink(r.emission, carrier, expected)) emitted++ else refused++ }
                 is InteractionProducer.Result.Refused -> refused++
             }
         }

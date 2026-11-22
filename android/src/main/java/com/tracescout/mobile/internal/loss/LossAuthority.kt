@@ -838,6 +838,30 @@ public object LossAuthority {
     @JvmStatic
     public fun evictionIntentId(bracketId: String, sequence: Long): String = "$bracketId-ev-$sequence"
 
+    /** Immutable project evidence, learned ONLY from explicitly owned queue records.
+     * Digests only, inside the authority directory so existing erasure/pruning owns
+     * its lifecycle. Missing/corrupt/foreign binding refuses chunkless disclosure.
+     * This sidecar never changes the frozen loss snapshot or settlement state. */
+    internal fun projectOwnership(filesDir: File, sid: String, project: String, bind: Boolean): Boolean =
+        synchronized(handles) {
+            if (project.isBlank()) return@synchronized false
+            val dir = EncryptedAuthorityStore.dirFor(filesDir, sid) ?: return@synchronized false
+            if (!dir.isDirectory) return@synchronized false
+            val lock = AuthorityLock.acquire(EncryptedAuthorityStore.rootFor(filesDir))
+            if (lock !is AuthorityLock.Acquisition.Ok) return@synchronized false
+            try {
+                if (EncryptedAuthorityStore.isPruned(dir)) return@synchronized false
+                val file = File(dir, "project-owner-v1.digest")
+                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(("project-owner-v1\u0000" + sid + "\u0000" + project).toByteArray(Charsets.UTF_8))
+                    .joinToString("") { "%02x".format(it) }
+                if (file.exists()) return@synchronized file.readText(Charsets.UTF_8) == digest
+                if (!bind) return@synchronized false
+                val result = DurableReplace.replace(file, DurableReplace.platformDirSync) { it.write(digest.toByteArray(Charsets.UTF_8)) }
+                result == DurableReplace.Outcome.COMMITTED && file.readText(Charsets.UTF_8) == digest
+            } catch (_: Exception) { false } finally { lock.release() }
+        }
+
     private val handles = ConcurrentHashMap<String, Handle>()
     private fun keyOf(filesDir: File, sessionId: String) = filesDir.absolutePath + "|" + sessionId
 

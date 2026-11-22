@@ -1977,8 +1977,7 @@ object TraceScoutMobile {
                 dropped = d,
                 clock = clock,
             )
-        }
-        true
+        } == EnqueueAdmission.SUBMITTED
     } ?: false
 
     /**
@@ -2179,8 +2178,7 @@ object TraceScoutMobile {
         enqueueDisclosing(id) { id, d ->
             Envelope.lifecycle(id, admit("mobile_lifecycle"), clock.monotonicNanos(), posture(),
                 transition, appState, clock = clock, dropped = d)
-        }
-        true
+        } == EnqueueAdmission.SUBMITTED
     } ?: false
 
     /**
@@ -2217,8 +2215,7 @@ object TraceScoutMobile {
             Envelope.navigation(id, admit("mobile_navigation"), clock.monotonicNanos(), posture(),
                 transition, toScreenId, fromScreenId, toScreenName, deepLinkPathTemplate,
                 clock = clock, dropped = d)
-        }
-        true
+        } == EnqueueAdmission.SUBMITTED
     } ?: false
 
     @JvmStatic
@@ -2227,8 +2224,7 @@ object TraceScoutMobile {
         enqueueDisclosing(id) { id, d ->
             Envelope.hang(id, admit("mobile_hang"), clock.monotonicNanos(), posture(),
                 durationMs, clock = clock, dropped = d)
-        }
-        true
+        } == EnqueueAdmission.SUBMITTED
     } ?: false
 
     /**
@@ -2488,8 +2484,8 @@ object TraceScoutMobile {
                 neverRecordProvider = { s -> s != null && com.tracescout.mobile.privacy.ScreenPolicy.isNeverRecord(s) },
                 // An interaction is never a reason to start a session.
                 captureEnabled = { interactionEnabled && identity != null },
-                sink = { e, carrier -> recordInteraction(e, carrier) },
-                sessionIdProvider = { identity?.sessionId },
+                sink = { e, carrier, expected -> recordInteraction(e, carrier, expected) == EnqueueAdmission.SUBMITTED },
+                identityProvider = { identity },
             ).also { interactionCapture = it; it.installForApplication(app) }
             activity?.let { c.install(it) }
             true
@@ -2590,8 +2586,8 @@ object TraceScoutMobile {
             if (!hostInteractionsEnabled)
                 return@guard HostInteraction.Decision.Refused(HostInteraction.REFUSED_NOT_ENABLED)
             // An interaction never starts a session.
-            if (identity == null)
-                return@guard HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION)
+            val expected = identity
+                ?: return@guard HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION)
             // The route the host already named, and ScreenPolicy's own answer
             // about it — neither is the caller's to assert here.
             val screen = interactionScreen
@@ -2623,26 +2619,13 @@ object TraceScoutMobile {
                             // for anything else, which leaves the row
                             // unattributed rather than claiming "native".
                             val carrier = webView?.let {
-                                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(it, identity?.sessionId)
+                                com.tracescout.mobile.capture.WebViewAttachment.carrierFor(it, expected.sessionId)
                             }
-                            // THE WRITER RETURNS A BARE BOOLEAN, so `false`
-                            // means EITHER the session ended between the check
-                            // above and this write OR its own guard caught a
-                            // fault. The two are separated HERE rather than
-                            // documented away, and without touching the shared
-                            // writer (the window observer's path, an earlier change): ask
-                            // the session question again. Still present ⇒ the
-                            // write failed for a reason that is not a session
-                            // fact, which is `internal_error`; gone ⇒ an
-                            // ordinary end-of-session race, and claiming an SDK
-                            // fault for that would send a host hunting a bug
-                            // that is not there.
-                            if (recordInteraction(r.emission, carrier))
-                                HostInteraction.Decision.Recorded(r.emission.gestureId)
-                            else if (identity == null)
-                                HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION)
-                            else
-                                HostInteraction.Decision.Refused(HostInteraction.REFUSED_INTERNAL_ERROR)
+                            when (recordInteraction(r.emission, carrier, expected)) {
+                                EnqueueAdmission.SUBMITTED -> HostInteraction.Decision.Recorded(r.emission.gestureId)
+                                EnqueueAdmission.NO_SESSION -> HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION)
+                                EnqueueAdmission.REFUSED -> HostInteraction.Decision.Refused(HostInteraction.REFUSED_INTERNAL_ERROR)
+                            }
                         }
                     }
             }
@@ -2875,21 +2858,19 @@ object TraceScoutMobile {
         enqueueDisclosing(id) { id, d ->
             Envelope.networkRequest(id, admit("mobile_network_request"), posture(),
                 facts, screenId, clock = clock, dropped = d)
-        }
-        true
+        } == EnqueueAdmission.SUBMITTED
     } ?: false
 
     internal fun recordInteraction(
         e: com.tracescout.mobile.capture.interaction.InteractionProducer.Emission,
-        webView: com.tracescout.mobile.capture.WebViewAttachment.Carrier? = null,
-    ): Boolean = guard("interaction") {
-        val id = identity ?: return@guard false
-        enqueueDisclosing(id) { id, d ->
+        webView: com.tracescout.mobile.capture.WebViewAttachment.Carrier?,
+        expected: Envelope.SessionIdentity,
+    ): EnqueueAdmission = guard("interaction") {
+        enqueueDisclosing(expected) { id, d ->
             Envelope.interaction(id, admit("mobile_interaction"), posture(), e,
                 clock = clock, dropped = d, webView = webView?.takeIf { it.nativeSessionId == id.sessionId })
         }
-        true
-    } ?: false
+    } ?: EnqueueAdmission.REFUSED
 
     /**
  * Opt in to attributing interactions inside ONE WebView to the segment
@@ -3591,10 +3572,12 @@ object TraceScoutMobile {
  */
     // Select the current user and assign the sequence within the same owner lock
     // as identify. A slow producer from a replaced session is refused, not relabelled.
+    internal enum class EnqueueAdmission { SUBMITTED, NO_SESSION, REFUSED }
+
     private inline fun enqueueDisclosing(expected: Envelope.SessionIdentity,
-        build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record) = synchronized(identityWriteLock) {
-        val live = identity ?: return@synchronized
-        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized
+        build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record): EnqueueAdmission = synchronized(identityWriteLock) {
+        val live = identity ?: return@synchronized EnqueueAdmission.NO_SESSION
+        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized EnqueueAdmission.NO_SESSION
         val d = takePreF6Dropped()
         val rec = try {
             build(live, d)
@@ -3607,6 +3590,7 @@ object TraceScoutMobile {
         // inside it can consume the record without the counts being accounted.
         bindPreF6Dropped(rec.eventId, d)
         enqueue(rec)
+        if (rec.sequence >= 0L) EnqueueAdmission.SUBMITTED else EnqueueAdmission.REFUSED
     }
 
     /**

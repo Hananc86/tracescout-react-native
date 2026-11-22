@@ -272,6 +272,44 @@ class Pr3PipelineRegressionTest {
         assertEquals("duplicate old ACK cannot clear successor",successor,snapshot(reopened.pendingCheckpoint()))
     }
 
+    @Test fun legacyAttachedAndNewEventOnlyDescriptorsResumeExactlyAndIntegrityStillRefuses() {
+        for (legacy in listOf(false,true)) {
+            val f=tmp();val h=strand(f,0,15,15);val q=queue(f)
+            for(n in 6L..10L)q.append(rec(n))
+            val bodies=ArrayList<String>()
+            pipeline(f,q,bodies){Uploader.Result(ResponseAction.RETRY,503,"temporary")}.upload(q.readAll().records,sid)
+            val store=InFlightStore.file(File(f,"inflight.txt"));val held=store.load()!!
+            val oldBody=if(legacy) {
+                val cp=realSink(f).f6CheckpointJson(sid,6,10,realSink(f).f6ReserveBytes(sid),resuming=true)!!
+                bodies[0].dropLast(1)+F6CheckpointEmitter.ATTACH_PREFIX+cp+"}"
+            } else bodies[0]
+            fun sha(text:String)=java.security.MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+                .joinToString(""){"%02x".format(it)}
+            assertTrue(store.save(held.copy(contentSha256=sha(oldBody))))
+            LossAuthority.closeAll();QueueHome.forgetForTest();F6CheckpointEmitter.resetForTest()
+            pipeline(f,q,bodies){Uploader.Result(ResponseAction.RETRY,503,"temporary")}.upload(q.readAll().records,sid)
+            assertEquals("frozen attachment choice must survive upgrade",oldBody,bodies.last())
+            assertEquals(2,bodies.size);assertEquals(5,q.readAll().records.size)
+            assertTrue(store.save(store.load()!!.copy(contentSha256="f".repeat(64))))
+            pipeline(f,q,bodies){error("corrupt descriptor reached HTTP")}.upload(q.readAll().records,sid)
+            assertEquals(2,bodies.size);assertEquals(15L,authority(f).pendingCheckpoint()!!.throughSequence)
+        }
+    }
+
+    @Test fun emptyQueueWithoutProjectEvidenceCannotDiscloseInheritedAuthority() {
+        val f=tmp();strand(f,0,6,6);val q=queue(f);val bodies=ArrayList<String>()
+        pipeline(f,q,bodies){error("unproven inherited project reached HTTP")}.upload(emptyList(),sid)
+        assertTrue(bodies.isEmpty());assertNotNull(authority(f).pendingCheckpoint())
+        val sink=realSink(f)
+        assertFalse(sink.projectOwnership(sid,"p"))
+        assertTrue(sink.projectOwnership(sid,"p",true))
+        assertFalse(sink.projectOwnership(sid,"foreign",true))
+        LossAuthority.closeAll();QueueHome.forgetForTest()
+        assertTrue(realSink(f).projectOwnership(sid,"p"));assertFalse(realSink(f).projectOwnership(sid,"foreign"))
+        File(EncryptedAuthorityStore.dirFor(f,sid),"project-owner-v1.digest").writeText("corrupt")
+        assertFalse(realSink(f).projectOwnership(sid,"p",true))
+    }
+
     @Test fun knownTerminalSessionNeverPostsStrandedCarrier() {
         val f=tmp();strand(f,0,6,8);val q=queue(f);q.append(rec(7));q.append(rec(8))
         var archives=0

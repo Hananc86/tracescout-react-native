@@ -1009,7 +1009,11 @@ class DurableUploadPipeline(
             // named by the durable record itself, never by a pointer this
             // process happens to hold — a process that died holds nothing.
             for (s in chunklessFinalityCandidates(fallbackSessionId)) {
-                finalizeChunklessSession(s)
+                val retry = attribution.f7PendingCheckpointRetry(s)
+                if (retry != null) postCarrierDocument(s, retry,
+                    "f7_metadata_only_request", "f7_metadata_only_retry",
+                    "f7_metadata_only_transport_failed", "f7_metadata_only_unacknowledged")
+                else finalizeChunklessSession(s)
             }
             return
         }
@@ -1217,7 +1221,7 @@ class DurableUploadPipeline(
                     // authority state): it renders the real counts against a
                     // worst-case 20-digit boundary, so recomputing it after the
                     // slice yields the same number.
-                    reserveFor = { sid -> attribution.f6ReserveBytes(sid) },
+                    reserveFor = { sid -> attribution.f6ReserveBytes(sid) + 38 },
                 )
                 batchSession = owned.first
                 slice = owned.second
@@ -1406,14 +1410,23 @@ class DurableUploadPipeline(
             // On resume the digest below still demands exactly the original body.
             val omitLargerPending = emissionClaim is AttributionSink.PendingClaim.Pending &&
                 emissionClaim.throughSequence > (batch.lastSequence.toLongOrNull() ?: -1L)
-            val f6Checkpoint = if (omitLargerPending) null else attribution.f6CheckpointJson(
+            val f6Checkpoint = if (omitLargerPending && pending == null) null else attribution.f6CheckpointJson(
                 batchSession,
                 batch.firstSequence.toLongOrNull() ?: -1L,
                 batch.lastSequence.toLongOrNull() ?: -1L,
                 attribution.f6ReserveBytes(batchSession),
                 resuming = pending != null,
             )
-            val body = encodeBody(batchSession, batch.chunkId, slice, f6Checkpoint)
+            val attachedBody = encodeBody(batchSession, batch.chunkId, slice, f6Checkpoint, recovery = true)
+            val legacyBody = if (pending != null) encodeBody(batchSession, batch.chunkId, slice, f6Checkpoint) else null
+            val eventOnlyBody = if (pending != null) encodeBody(batchSession, batch.chunkId, slice, null) else null
+            val body = when {
+                pending == null -> attachedBody
+                sha256Hex(attachedBody) == pending.contentSha256 -> attachedBody
+                legacyBody != null && sha256Hex(legacyBody) == pending.contentSha256 -> legacyBody
+                eventOnlyBody != null && sha256Hex(eventOnlyBody) == pending.contentSha256 -> eventOnlyBody
+                else -> attachedBody // existing integrity refusal below remains authoritative
+            }
 
             if (pending != null && (batch.chunkId != pending.chunkId ||
                     sha256Hex(body) != pending.contentSha256)
@@ -1571,6 +1584,12 @@ class DurableUploadPipeline(
                 }
                 RecoveryTrace.log("http_request_started", "attempt" to attempt)
                 drainPosted++
+                if (slice.all { recordField(it, "projectId") == projectId } &&
+                    !attribution.projectOwnership(batchSession, projectId, bindFromRecords = true)) {
+                    results.last = localRefusal("project_binding_not_durable")
+                    disposition = Disposition.RETRYABLE_REMAINING
+                    return
+                }
                 val r = poster.post(projectId, body)
                 results.last = r
                 RecoveryTrace.log("http_response_received", "action" to r.action.name,
@@ -1988,10 +2007,12 @@ class DurableUploadPipeline(
         chunkId: String,
         slice: List<ByteArray>,
         lossCheckpoint: String? = null,
+        recovery: Boolean = false,
     ): ByteArray =
         ("{\"sessionId\":\"" + sessionId + "\",\"chunkId\":\"" + chunkId +
             "\",\"events\":[" + slice.joinToString(",") { String(it, Charsets.UTF_8) } + "]" +
             (if (lossCheckpoint != null) F6CheckpointEmitter.ATTACH_PREFIX + lossCheckpoint else "") +
+            (if (lossCheckpoint != null && recovery) ",\"lossRecovery\":\"committed-events-v1\"" else "") +
             "}")
             .toByteArray(Charsets.UTF_8)
 
@@ -2714,7 +2735,8 @@ class DurableUploadPipeline(
  * empty `events` array and a present `lossCheckpoint` BEFORE any chunk
  * preflight, so this reuses the ONE body encoder with an EMPTY slice and the
  * EXISTING `lossCheckpoint` key — no second encoder, no second wire writer,
- * no new endpoint, no protocol change.
+ * no new endpoint. Pending retries opt in to the committed-events-v1
+ * addendum; fresh metadata-only disclosures keep historical v1 arithmetic.
  *
  * **THIS HAS NO PRODUCTION CALLER YET, AND THAT IS DELIBERATE.** The
  * frozen authority names no product TRIGGER for a chunkless disclosure —
@@ -2803,10 +2825,12 @@ class DurableUploadPipeline(
             })
             return MetadataOnly.NotSent("carrier_ownership_unreadable")
         val owned = records.filter { recordField(it, "sessionId") == sessionId }
+        if (owned.isEmpty() && !attribution.projectOwnership(sessionId, projectId))
+            return MetadataOnly.NotSent("carrier_project_unproven")
         if (sliceProjectRefusal(owned) != null)
             return MetadataOnly.NotSent("carrier_project_mismatch")
         // The ONE body encoder, with an EMPTY slice: `"events":[]`.
-        val body = encodeBody(sessionId, doc.chunkId, emptyList(), doc.json)
+        val body = encodeBody(sessionId, doc.chunkId, emptyList(), doc.json, recovery = doc.retry)
         RecoveryTrace.log(
             if (doc.retry) retryEvent else requestEvent,
             "session" to sessionId.take(24), "chunk" to doc.chunkId.take(12),

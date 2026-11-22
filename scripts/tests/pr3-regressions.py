@@ -31,11 +31,12 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 object Envelope {
  data class SessionIdentity(val sessionId:String,val projectId:String,val userId:String)
- data class Record(val eventId:String)
+ data class Record(val eventId:String,val sequence:Long=0)
 }
 object RecoveryTrace { fun log(vararg x:Any?) {} }
 class Context(val filesDir:File)
 class Subject {
+ enum class EnqueueAdmission { SUBMITTED, NO_SESSION, REFUSED }
  val identityWriteLock=Any()
  var identity:Envelope.SessionIdentity?=null
  var sequence=0
@@ -81,7 +82,7 @@ fun main() {
  check(s.records.all{it.second.userId=="user-b"}) { "late capture reverted identity" }
  println("PASS controlled capture/identify interleaving: higher sequence retains current user")
  val before=s.sequence;s.replace(initial.copy(sessionId="session-b"))
- s.enqueueDisclosing(initial){_,_->error("stale-session builder executed")};check(s.sequence==before)
+ check(s.enqueueDisclosing(initial){_,_->error("stale-session builder executed")}==Subject.EnqueueAdmission.NO_SESSION);check(s.sequence==before)
  s.replace(null);s.enqueueDisclosing(initial){_,_->error("no-session builder executed")}
  s.replace(initial.copy(projectId="project-b"));s.enqueueDisclosing(initial){_,_->error("foreign-project builder executed")}
  println("PASS old session, no session and foreign project refuse before allocation")
