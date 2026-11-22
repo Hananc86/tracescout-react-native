@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// RN iOS CRASH + HANG CAPTURE — the platform seams, and nothing else.
 ///
@@ -53,6 +54,20 @@ public enum RnIncidentObserver {
     /// The handler registered before us. Invoked after we persist.
     private static var previousHandler: (@convention(c) (NSException) -> Void)?
 
+    private static let ownHandler: @convention(c) (NSException) -> Void = { exception in
+        RnIncidentObserver.handleUncaught(exception)
+    }
+    private static var handlerRegistered = false
+    private static func handlerAddress(_ handler: (@convention(c) (NSException) -> Void)?) -> UInt? {
+        handler.map { unsafeBitCast($0, to: UInt.self) }
+    }
+    static func canRegisterHandler(registered: Bool, current: UInt?, ours: UInt) -> Bool {
+        !registered || current == ours
+    }
+    static func shouldRestoreHandler(installed: Bool, current: UInt?, ours: UInt) -> Bool {
+        installed && current == ours
+    }
+
     private static var installedFlag = false
     private static var hangThresholdMs: Int = 3_000
     private static var watchdog: Thread?
@@ -76,6 +91,24 @@ public enum RnIncidentObserver {
     /// same counter design the Android `HangDetector` uses, for the same reason.
     private static var heartbeat: Int64 = 0
     private static var heartbeatTimer: DispatchSourceTimer?
+    private static var activityObserver: NSObjectProtocol?
+    private static var applicationActive = false
+    private static var activityEpoch: UInt64 = 0
+
+    struct HangObservation {
+        private var lastSeen: Int64?
+        private var lastChange: UInt64 = 0
+        private var lastEpoch: UInt64 = 0
+        mutating func blockedMillis(heartbeat: Int64, now: UInt64, active: Bool, epoch: UInt64) -> Int? {
+            if !active || epoch != lastEpoch || lastSeen != heartbeat {
+                lastSeen = active ? heartbeat : nil
+                lastChange = now
+                lastEpoch = epoch
+                return nil
+            }
+            return Int((now &- lastChange) / 1_000_000)
+        }
+    }
 
     /// What the producer must know to describe an incident, read AT INCIDENT
     /// TIME.
@@ -133,18 +166,20 @@ public enum RnIncidentObserver {
     public static func install(context ctx: Context, hangThresholdMs ms: Int = 3_000) -> Bool {
         lock.lock()
         if installedFlag { lock.unlock(); return false }
+        let current = NSGetUncaughtExceptionHandler()
+        guard canRegisterHandler(registered: handlerRegistered, current: handlerAddress(current),
+                                 ours: handlerAddress(ownHandler)!) else { lock.unlock(); return false }
+        if !handlerRegistered {
+            previousHandler = current
+            NSSetUncaughtExceptionHandler(ownHandler)
+            handlerRegistered = true
+        }
         installedFlag = true
         context = ctx
         hangThresholdMs = ms
         let watchdogToken = watchdogGeneration.begin()
-        // CAPTURED BEFORE WE REPLACE IT. Reading it afterwards would return
-        // our own handler and the chain would be a self-reference.
-        previousHandler = NSGetUncaughtExceptionHandler()
         lock.unlock()
 
-        NSSetUncaughtExceptionHandler { exception in
-            RnIncidentObserver.handleUncaught(exception)
-        }
         RecoveryTrace.shared.log("rn_crash_installed", [])
 
         // THE FLOOR IS THE ANDROID TWIN'S, AND A THRESHOLD BELOW IT IS
@@ -164,16 +199,26 @@ public enum RnIncidentObserver {
     /// Restore the previous handler and stop the watchdog. Teardown and tests.
     public static func uninstall() {
         lock.lock()
-        let prev = previousHandler
+        guard installedFlag else { lock.unlock(); return }
+        if shouldRestoreHandler(installed: installedFlag, current: handlerAddress(NSGetUncaughtExceptionHandler()),
+                                ours: handlerAddress(ownHandler)!) {
+            NSSetUncaughtExceptionHandler(previousHandler)
+            previousHandler = nil
+            handlerRegistered = false
+        }
+        // A newer reporter may chain through our wrapper. Keep its predecessor
+        // available, and refuse to re-register until our wrapper is current again.
         installedFlag = false
-        previousHandler = nil
         context = nil
         watchdogGeneration.cancel()
+        applicationActive = false
+        activityEpoch &+= 1
+        if let observer = activityObserver { NotificationCenter.default.removeObserver(observer) }
+        activityObserver = nil
         heartbeatTimer?.cancel()
         heartbeatTimer = nil
         watchdog = nil
         lock.unlock()
-        NSSetUncaughtExceptionHandler(prev)
     }
 
     public static func isInstalled() -> Bool {
@@ -267,34 +312,45 @@ public enum RnIncidentObserver {
         defer { lock.unlock() }
         guard installedFlag, watchdogGeneration.accepts(token) else { return }
 
-        // The main thread's ONLY job: bump a counter. No allocation, no I/O,
-        // nothing that can itself contribute to a hang.
+        applicationActive = false
+        activityEpoch &+= 1
+        activityObserver = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
+            object: nil, queue: nil) { _ in
+                lock.lock()
+                if watchdogGeneration.accepts(token) { applicationActive = false; activityEpoch &+= 1 }
+                lock.unlock()
+            }
+        // Only a main-thread heartbeat may resume active observation. A watchdog
+        // that wakes first after process suspension must still see inactive.
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now(), repeating: .milliseconds(200))
         t.setEventHandler {
-            lock.lock(); if watchdogGeneration.accepts(token) { heartbeat &+= 1 }; lock.unlock()
+            let active = UIApplication.shared.applicationState == .active
+            lock.lock()
+            if watchdogGeneration.accepts(token) {
+                if applicationActive != active { activityEpoch &+= 1 }
+                applicationActive = active
+                heartbeat &+= 1
+            }
+            lock.unlock()
         }
         t.resume()
         heartbeatTimer = t
 
         let w = Thread {
-            var lastSeen: Int64 = -1
-            var lastChangeNanos = DispatchTime.now().uptimeNanoseconds
+            var observation = HangObservation()
             var reportedForThisStall = false
             while true {
                 lock.lock()
                 let running = watchdogGeneration.accepts(token)
                 let beat = heartbeat
+                let active = applicationActive
+                let activity = activityEpoch
                 lock.unlock()
                 if !running { return }
 
                 let now = DispatchTime.now().uptimeNanoseconds
-                if beat != lastSeen {
-                    lastSeen = beat
-                    lastChangeNanos = now
-                    reportedForThisStall = false
-                } else {
-                    let blockedMs = Int((now &- lastChangeNanos) / 1_000_000)
+                if let blockedMs = observation.blockedMillis(heartbeat: beat, now: now, active: active, epoch: activity) {
                     // ONCE PER STALL, NOT ONCE PER POLL. Without this flag a
                     // ten-second block would emit a hang every 200 ms — fifty
                     // records describing one event, each with a different
@@ -306,7 +362,7 @@ public enum RnIncidentObserver {
                         reportedForThisStall = true
                         emitHang(blockedMs: blockedMs, thresholdMs: ms, token: token)
                     }
-                }
+                } else { reportedForThisStall = false }
                 Thread.sleep(forTimeInterval: 0.2)
             }
         }
@@ -322,7 +378,7 @@ public enum RnIncidentObserver {
     /// it takes the ordinary enqueue and asks for a drain.
     private static func emitHang(blockedMs: Int, thresholdMs: Int, token: UInt64) {
         lock.lock()
-        guard watchdogGeneration.accepts(token) else { lock.unlock(); return }
+        guard watchdogGeneration.accepts(token), applicationActive else { lock.unlock(); return }
         let ctx = context
         lock.unlock()
         guard let ctx = ctx, let id = ctx.identity() else { return }

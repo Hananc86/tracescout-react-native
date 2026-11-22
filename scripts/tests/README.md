@@ -116,3 +116,15 @@ The integration fault withholds both event-response loss ACKs and the automatic
 empty-carrier ACK until the intended restart. It retains the real server replies
 for duplicate-ACK checks; no synthetic loss ACK is introduced. The Gradle fixture
 stages this integration case only when the harness supplies `RECOVERY_TEST_ENDPOINT`.
+
+The native frame test pairs a newly published identity with an old transport and
+requires refusal until the complete matching session/config/uploader tuple is
+published. A production authority-enumeration failure must preserve empty-queue
+retry rather than appear as an empty authority directory.
+
+The portable Swift probe also executes generation retirement, inactive/active
+hang timing and exception-handler ownership decisions; unsafe variants must fail
+their intended assertions after compilation. UIKit lifecycle integration still
+requires Apple SDK/device validation. `node scripts/tests/pr3-native-dispatch.cjs`
+executes the actual TypeScript wrappers and shared dispatcher against native spies,
+and rejects a compiled dispatcher mutation that discards arguments.

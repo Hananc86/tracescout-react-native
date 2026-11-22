@@ -89,6 +89,7 @@ jobs:
           npm run build 2>&1 | tee ci-results/build.log
           python3 scripts/surface-agreement.py . | tee ci-results/surface.log
           python3 scripts/tests/pr3-surface-controls.py | tee ci-results/surface-controls.log
+          node scripts/tests/pr3-native-dispatch.cjs | tee ci-results/native-dispatch.log
           python3 scripts/prepublish-check.py . | tee ci-results/packed-files.log
       - uses: actions/upload-artifact@v4
         if: always()

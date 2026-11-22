@@ -137,13 +137,15 @@ fun main() {
  println("PASS ordinary flush retains checkpoint retry without scheduling completed drains")
  s.replace(initial)
  val attempted=CountDownLatch(1)
- val stale=Thread { attempted.countDown(); s.claimEnd() }
- synchronized(s.identityWriteLock) {
+ val endResult=java.util.concurrent.atomic.AtomicReference<Subject.SessionEndEmission>()
+ val stale=Thread { attempted.countDown(); endResult.set(s.claimEnd()) }
+ s.identityWriteLock.withLock {
    stale.start();check(attempted.await(5,TimeUnit.SECONDS))
    s.replace(initial.copy(sessionId="session-b"))
    check(s.claimEnd()==Subject.SessionEndEmission.EMITTED)
  }
  stale.join(5000);check(!stale.isAlive)
+ check(endResult.get()==Subject.SessionEndEmission.ALREADY_EMITTED)
  check(s.sessionEndClaim.get()!!.startsWith("session-b#"))
  check(s.claimEnd()==Subject.SessionEndEmission.ALREADY_EMITTED)
  println("PASS competing end claim cannot overwrite a newer session token or permit duplicate end")

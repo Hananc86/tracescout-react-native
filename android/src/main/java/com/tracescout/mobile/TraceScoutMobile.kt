@@ -724,6 +724,7 @@ object TraceScoutMobile {
         val liveUploader = Uploader(cfg.baseUrl, cfg.ingestKey)
         config = cfg
         uploader = liveUploader
+        frameTransport = FrameTransport(newIdentity.sessionId, cfg, liveUploader)
         // The transport group is complete — close it BEFORE the recovery
         // generation, the worker drain and the inherited drain below, so every
         // one of them reads a settled quadruple rather than a publication in
@@ -1995,6 +1996,19 @@ object TraceScoutMobile {
         } == EnqueueAdmission.SUBMITTED
     } ?: false
 
+    private data class FrameTransport(val sessionId: String, val config: Config, val uploader: Uploader)
+    @Volatile private var frameTransport: FrameTransport? = null
+
+    private fun captureFrameTransport(): Pair<Envelope.SessionIdentity, FrameTransport>? {
+        val epoch = transportEpoch
+        if (epoch % 2L != 0L || transportOwner != TransportOwner.LIVE) return null
+        val id = identity ?: return null
+        val bound = frameTransport ?: return null
+        if (bound.sessionId != id.sessionId || bound.config.projectId != id.projectId ||
+            config !== bound.config || uploader !== bound.uploader || transportEpoch != epoch) return null
+        return id to bound
+    }
+
     /**
  * Capture + upload ONE visual frame for [root].
  *
@@ -2015,9 +2029,13 @@ object TraceScoutMobile {
         screenId: String,
         captureReason: String = "explicit_allow",
     ): String? = guard("frame") {
-        val id = identity ?: return@guard null
-        val cfg = config ?: return@guard null
-        val up = uploader ?: return@guard null
+        val capture = captureFrameTransport() ?: run {
+            lastFrameRefusal = "frame_transport_unavailable"
+            return@guard null
+        }
+        val (id, boundTransport) = capture
+        val cfg = boundTransport.config
+        val up = boundTransport.uploader
         // Each call reports ITS OWN refusal: a stale code from an earlier
         // capture would be read as this one's reason (CodeRabbit #1, an earlier change).
         lastFrameRefusal = null
@@ -2151,6 +2169,10 @@ object TraceScoutMobile {
         worker.execute {
             // The single worker runs the metadata append first, including its
             // completion callback. Refused/indeterminate metadata has no clock.
+            if (frameTransport !== boundTransport || config !== cfg || uploader !== up || identity?.sessionId != id.sessionId) {
+                lastFrameRefusal = "frame_transport_replaced"
+                return@execute
+            }
             if (!metadataCommitted.get()) {
                 lastFrameRefusal = "metadata_not_committed"
                 return@execute

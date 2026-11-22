@@ -196,6 +196,16 @@ class Pr3PipelineRegressionTest {
     )
 
 
+    @Test fun productionAuthorityEnumerationFailureRetainsEmptyQueueRetry() {
+        val f=tmp();val q=queue(f)
+        val root=EncryptedAuthorityStore.rootFor(f).toPath()
+        java.nio.file.Files.createSymbolicLink(root,root)
+        val p=pipeline(f,q,ArrayList()){error("unreadable enumeration must not post")}
+        p.upload(emptyList(),"")
+        assertEquals("production enumeration silently erased retry",DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED,p.disposition)
+        assertTrue(LossAuthority.hasPendingRecovery(f))
+    }
+
     @Test fun emptyCheckpointRecoveryHonorsErasureRequest() {
         for(unreadable in listOf(false,true)) {
             val f=tmp();val h=strand(f,0,6,8);val q=queue(f)

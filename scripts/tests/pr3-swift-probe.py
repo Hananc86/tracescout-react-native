@@ -124,3 +124,26 @@ print("PASS actual Swift watchdog generation retires old threads across reinstal
 ''')
 assert 'let running = watchdogGeneration.accepts(token)' in observer
 assert 'watchdogGeneration.cancel()' in observer
+
+s=observer
+print(block('struct HangObservation {'))
+print(r'''var observation = HangObservation()
+precondition(observation.blockedMillis(heartbeat: 1, now: 0, active: true, epoch: 1) == nil)
+precondition(observation.blockedMillis(heartbeat: 1, now: 10_000_000_000, active: false, epoch: 2) == nil, "suspension counted as hang")
+precondition(observation.blockedMillis(heartbeat: 1, now: 60_000_000_000, active: false, epoch: 2) == nil)
+precondition(observation.blockedMillis(heartbeat: 1, now: 61_000_000_000, active: true, epoch: 3) == nil)
+precondition(observation.blockedMillis(heartbeat: 1, now: 64_100_000_000, active: true, epoch: 3) == 3100)
+precondition(observation.blockedMillis(heartbeat: 2, now: 64_200_000_000, active: true, epoch: 3) == nil)
+print("PASS actual Swift hang observation excludes suspension and retains real active stalls")
+''')
+print('enum HandlerOwnershipProbe {\n'+block('static func canRegisterHandler(')+'\n'+block('static func shouldRestoreHandler(')+'\n}')
+print(r'''precondition(HandlerOwnershipProbe.shouldRestoreHandler(installed: true, current: 2, ours: 2))
+precondition(!HandlerOwnershipProbe.shouldRestoreHandler(installed: true, current: 3, ours: 2), "foreign exception handler overwritten")
+precondition(!HandlerOwnershipProbe.shouldRestoreHandler(installed: false, current: 2, ours: 2), "repeated uninstall overwrote host handler")
+precondition(!HandlerOwnershipProbe.canRegisterHandler(registered: true, current: 3, ours: 2))
+precondition(HandlerOwnershipProbe.canRegisterHandler(registered: true, current: 2, ours: 2))
+precondition(HandlerOwnershipProbe.canRegisterHandler(registered: false, current: 1, ours: 2))
+print("PASS actual Swift exception-handler ownership preserves newer and restored registrations")
+''')
+assert 'UIApplication.willResignActiveNotification' in observer
+assert 'UIApplication.shared.applicationState == .active' in observer

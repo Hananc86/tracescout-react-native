@@ -8,6 +8,8 @@ resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 out = Path('ci-results/swift')
 source = (out / 'main.swift').read_text()
 cases = [
+    ('unsafe-suspension', '!active || epoch != lastEpoch || lastSeen != heartbeat', 'lastSeen != heartbeat', 'suspension counted as hang'),
+    ('unsafe-handler-owner', 'installed && current == ours', 'installed', 'foreign exception handler overwritten'),
     ('unsafe-watchdog', 'active == token', 'active != nil', 'retired watchdog revived after reinstall'),
     ('unsafe-exception', 'return known.contains(raw) ? raw : "NSException"', 'return raw', 'exception name privacy leak'),
     ('unsafe-hierarchy', '65_536 - 512 - IdentityPolicy.userIdMax * 6', '65_536 - 512', 'hierarchy identity growth exceeded budget'),

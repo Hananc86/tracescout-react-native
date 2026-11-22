@@ -14,6 +14,39 @@ import com.tracescout.mobile.queue.DurableReplace
 import javax.crypto.KeyGenerator
 
 class Pr3InteractionAdmissionTest {
+    @Test fun framesRequireOneCompletedSessionTransportPublication() {
+        val subject=TraceScoutMobile
+        fun field(n:String)=subject.javaClass.getDeclaredField(n).apply{isAccessible=true}
+        val fields=listOf("identity","config","uploader","frameTransport","transportEpoch","transportOwner").associateWith{field(it)}
+        val prior=fields.mapValues{it.value.get(subject)}
+        val type=Class.forName("com.tracescout.mobile.TraceScoutMobile\$FrameTransport")
+        val ctor=type.declaredConstructors.first().apply{isAccessible=true}
+        val read=subject.javaClass.getDeclaredMethod("captureFrameTransport").apply{isAccessible=true}
+        fun set(n:String,v:Any?)=fields.getValue(n).set(subject,v)
+        val ownerType=fields.getValue("transportOwner").type
+        val live=ownerType.enumConstants.first{(it as Enum<*>).name=="LIVE"}
+        val boot=ownerType.enumConstants.first{(it as Enum<*>).name=="BOOTSTRAP"}
+        val a=Envelope.SessionIdentity("project-a","session-a","anonymous","test","1","1","app","screen")
+        val b=a.copy(projectId="project-b",sessionId="session-b")
+        val ca=TraceScoutMobile.Config("project-a","synthetic-a","https://a.invalid")
+        val cb=TraceScoutMobile.Config("project-b","synthetic-b","https://b.invalid")
+        val ua=com.tracescout.mobile.transport.Uploader(ca.baseUrl,ca.ingestKey)
+        val ub=com.tracescout.mobile.transport.Uploader(cb.baseUrl,cb.ingestKey)
+        try {
+            set("identity",a);set("config",ca);set("uploader",ua);set("frameTransport",ctor.newInstance(a.sessionId,ca,ua))
+            set("transportEpoch",2L);set("transportOwner",live);assertNotNull(read.invoke(subject))
+            set("identity",b)
+            assertNull("new session paired with foreign endpoint",read.invoke(subject))
+            set("config",cb);set("uploader",ub)
+            assertNull("unpublished frame transport accepted",read.invoke(subject))
+            set("frameTransport",ctor.newInstance(b.sessionId,cb,ub));assertNotNull(read.invoke(subject))
+            set("transportEpoch",3L);assertNull(read.invoke(subject));set("transportEpoch",4L)
+            set("transportOwner",boot);assertNull(read.invoke(subject));set("transportOwner",live)
+            set("config",ca);assertNull("torn config accepted",read.invoke(subject))
+            set("config",cb);assertNotNull("complete matching capture disabled",read.invoke(subject))
+        } finally {fields.forEach{(n,f)->f.set(subject,prior[n])}}
+    }
+
     @Test fun concurrentCrashHandlersCannotOverwriteOutstandingAdmission() {
         val dir=java.nio.file.Files.createTempDirectory("pr3-concurrent-crash").toFile()
         val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()

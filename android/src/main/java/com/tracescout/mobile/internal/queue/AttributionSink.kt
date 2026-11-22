@@ -656,7 +656,7 @@ public interface AttributionSink {
  * would be a second owner of it.
  */
                 override fun f7InheritedSessions(exclude: String): List<String> =
-                    LossAuthority.sessionIdsOnDisk(filesDir, exclude)
+                    LossAuthority.sessionIdsOnDiskOrThrow(filesDir, exclude)
 
                 /**
  * F-15 — the SAME `f6Handle` door a FOURTH time, deliberately.

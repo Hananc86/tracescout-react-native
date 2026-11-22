@@ -1539,25 +1539,25 @@ public object LossAuthority {
  * directory whose name does not decode is skipped rather than approximated.
  */
     public fun sessionIdsOnDisk(filesDir: File, exclude: String): List<String> = try {
-        val root = EncryptedAuthorityStore.rootFor(filesDir)
-        if (!root.isDirectory) emptyList()
-        else {
-            // ONE PREDICATE, ONE EXCLUSION, ONE LISTING. The first version
-            // counted with this predicate and then filtered with it again, and
-            // excluded the caller's own session TWICE — once by directory name
-            // here and once by decoded id afterwards. A negative control said
-            // NOT CAUGHT and was right about the code, not about the suite:
-            // with two exclusions neither is load-bearing, so neither can be
-            // shown to matter. Now removing this one reddens `R2-12`.
-            val mine = EncryptedAuthorityStore.dirFor(filesDir, exclude)?.name
-            (root.listFiles() ?: emptyArray())
-                .filter { it.isDirectory && !EncryptedAuthorityStore.isPruned(it) && it.name != mine }
-                .sortedBy { it.name }
-                .mapNotNull { AuthorityNaming.decodeSessionDirName(it.name) }
-        }
+        sessionIdsOnDiskOrThrow(filesDir, exclude)
     } catch (t: Throwable) {
         RecoveryTrace.log("authority_dir_list_failed", "why" to t.javaClass.simpleName)
         emptyList()
+    }
+
+    /** Recovery must distinguish a missing root from an unreadable listing. */
+    public fun sessionIdsOnDiskOrThrow(filesDir: File, exclude: String): List<String> {
+        val root = EncryptedAuthorityStore.rootFor(filesDir)
+        val attributes = try {
+            java.nio.file.Files.readAttributes(root.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+        } catch (_: java.nio.file.NoSuchFileException) { return emptyList() }
+        if (!attributes.isDirectory) throw java.io.IOException("authority_root_not_directory")
+        val mine = EncryptedAuthorityStore.dirFor(filesDir, exclude)?.name
+        val dirs = root.listFiles() ?: throw java.io.IOException("authority_listing_unreadable")
+        return dirs.filter {
+            val child = java.nio.file.Files.readAttributes(it.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+            child.isDirectory && !EncryptedAuthorityStore.isPruned(it) && it.name != mine
+        }.sortedBy { it.name }.mapNotNull { AuthorityNaming.decodeSessionDirName(it.name) }
     }
 
     /**
