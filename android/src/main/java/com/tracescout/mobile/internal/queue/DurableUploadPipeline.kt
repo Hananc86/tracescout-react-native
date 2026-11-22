@@ -1583,13 +1583,17 @@ class DurableUploadPipeline(
                     return
                 }
                 RecoveryTrace.log("http_request_started", "attempt" to attempt)
-                drainPosted++
                 if (slice.all { recordField(it, "projectId") == projectId } &&
-                    !attribution.projectOwnership(batchSession, projectId, bindFromRecords = true)) {
+                    !projectBoundBeforePost(batchSession, batch.chunkId)) {
                     results.last = localRefusal("project_binding_not_durable")
                     disposition = Disposition.RETRYABLE_REMAINING
                     return
                 }
+                // E-5 counts attempts that POSTED. A local refusal above sent
+                // nothing, so it must not accrue toward the no-progress bound —
+                // counted there, enough refusals parked the batch behind
+                // `NO_PROGRESS_BOUND` even after the binding became durable.
+                drainPosted++
                 val r = poster.post(projectId, body)
                 results.last = r
                 RecoveryTrace.log("http_response_received", "action" to r.action.name,
@@ -2650,6 +2654,43 @@ class DurableUploadPipeline(
  * have been appended since), never another session, never the running
  * session's state, never a server assumption, never a local counter.
  */
+    /**
+ * The durable session/project binding, established BEFORE the POST it guards.
+ *
+ * An inherited pre-F2 session has no authority on disk, the read-only door
+ * creates none, and the binding lives inside the authority directory — so
+ * the bind answered `false` on every drain and strict FIFO held the queue
+ * head for the life of the install. The only door that creates an authority
+ * ran after a POST, which these records could never reach.
+ *
+ * So when the bind fails, the session's trustworthy surviving records are
+ * adopted through the SAME creating door a removal uses ([AttributionSink.adoptForRemoval],
+ * the store's own read and its own integrity answer), and the bind is asked
+ * again. Delivery is the removal those records are headed for, so this is
+ * that door opened one step earlier, not a second one. Anything short of a
+ * durable adoption — an untrustworthy queue, a fenced or unopenable
+ * authority, an unwired sink — still refuses: ownership that cannot be
+ * established before the POST does not authorize it.
+ */
+    private fun projectBoundBeforePost(session: String, chunkId: String): Boolean {
+        if (attribution.projectOwnership(session, projectId, bindFromRecords = true)) return true
+        val queue: List<ByteArray>
+        val trustworthy: Boolean
+        try {
+            queue = store.readRecords()
+            trustworthy = store.integrityClass() == RecordStore.INTEGRITY_OK
+        } catch (t: Throwable) {
+            if (t is SimulatedProcessDeath) throw t
+            RecoveryTrace.log("pre_post_adoption_unreadable", "code" to t.javaClass.simpleName, "chunk" to chunkId.take(12))
+            return false
+        }
+        val a = attribution.adoptForRemoval(session, queue, trustworthy)
+        RecoveryTrace.log("pre_post_adoption", "outcome" to a.javaClass.simpleName,
+            "session" to session.take(24), "chunk" to chunkId.take(12))
+        if (a !is AttributionSink.Adoption.Ready) return false
+        return attribution.projectOwnership(session, projectId, bindFromRecords = true)
+    }
+
     private fun adoptedForRemoval(session: String, chunkId: String): Boolean {
         val queue: List<ByteArray>
         val trustworthy: Boolean

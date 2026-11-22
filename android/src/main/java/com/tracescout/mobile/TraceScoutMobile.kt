@@ -2209,9 +2209,12 @@ object TraceScoutMobile {
         // by any later check still re-pointed it — and every following tap was
         // then attributed to a screen with no `mobile_navigation` event in the
         // session. The route moves only when the navigation is actually going
-        // to be recorded.
-        interactionScreen = toScreenId
-        enqueueDisclosing(id) { id, d ->
+        // to be recorded — and that decision is the admission's, taken under
+        // `identityWriteLock`. Written out here, before the session check, a
+        // caller that captured session A and resumed after session B started
+        // re-pointed B's route to A's screen while its own navigation was
+        // refused `NO_SESSION`. A refused navigation leaves the route alone.
+        enqueueDisclosing(id, onSubmitted = { interactionScreen = toScreenId }) { id, d ->
             Envelope.navigation(id, admit("mobile_navigation"), clock.monotonicNanos(), posture(),
                 transition, toScreenId, fromScreenId, toScreenName, deepLinkPathTemplate,
                 clock = clock, dropped = d)
@@ -3575,6 +3578,7 @@ object TraceScoutMobile {
     internal enum class EnqueueAdmission { SUBMITTED, NO_SESSION, REFUSED }
 
     private inline fun enqueueDisclosing(expected: Envelope.SessionIdentity,
+        noinline onSubmitted: (() -> Unit)? = null,
         build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record): EnqueueAdmission = synchronized(identityWriteLock) {
         val live = identity ?: return@synchronized EnqueueAdmission.NO_SESSION
         if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized EnqueueAdmission.NO_SESSION
@@ -3589,8 +3593,12 @@ object TraceScoutMobile {
         // durable append says COMMITTED. Bound BEFORE `enqueue`, so no path
         // inside it can consume the record without the counts being accounted.
         bindPreF6Dropped(rec.eventId, d)
-        enqueue(rec)
-        if (rec.sequence >= 0L) EnqueueAdmission.SUBMITTED else EnqueueAdmission.REFUSED
+        // SUBMITTED MEANS THE APPEND TASK WAS SCHEDULED, and only `enqueue`
+        // knows that. A nonnegative sequence is not that fact: during first
+        // start the authority is published before `config`, so a concurrent
+        // producer can hold a real sequence while `enqueue` returns without
+        // scheduling anything — and the host was told `Recorded`.
+        if (enqueue(rec)) { onSubmitted?.invoke(); EnqueueAdmission.SUBMITTED } else EnqueueAdmission.REFUSED
     }
 
     /**
@@ -3598,7 +3606,7 @@ object TraceScoutMobile {
  * function, so the queue's drop policy is identical across bindings and is
  * covered by the golden fixtures rather than reimplemented here.
  */
-    private fun enqueue(rec: Envelope.Record) {
+    private fun enqueue(rec: Envelope.Record): Boolean {
         // PRE-F6: the counts were MOVED out of the accumulator to build this
         // envelope and are already bound in flight to `rec.eventId`, so every
         // path that does not reach the durable append must put them back —
@@ -3612,7 +3620,7 @@ object TraceScoutMobile {
         // disclosure travels through the in-flight field keyed by event id
         // rather than through a new argument. Re-pointing three accepted pins
         // because a new change moved their anchor is the larger intervention.
-        val cfg = config ?: run { returnPreF6Dropped(rec.eventId); return }
+        val cfg = config ?: run { returnPreF6Dropped(rec.eventId); return false }
         if (rec.sequence < 0) {
             returnPreF6Dropped(rec.eventId)
             // Nothing was claimed for this record (see `admit`), so nothing
@@ -3620,7 +3628,7 @@ object TraceScoutMobile {
             // stamped with a number nobody owns would be a gap the authority
             // could never explain.
             RecoveryTrace.log("enqueue_unnumbered_dropped", "eventType" to rec.eventType)
-            return
+            return false
         }
         val ticket = tickets[rec.sequence]
         if (ticket != null && ticket.eventType != rec.eventType) {
@@ -3991,6 +3999,8 @@ object TraceScoutMobile {
                 returnPreF6Dropped(rec.eventId)
             }
         }
+        // The append task is scheduled; its durability is the worker's answer.
+        return true
     }
 
     /**

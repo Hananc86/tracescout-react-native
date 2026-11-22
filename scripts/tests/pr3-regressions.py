@@ -19,7 +19,7 @@ s=read('TraceScoutMobile.kt')
 start=s[s.index('beginTransportChange(TransportOwner.LIVE)'):s.index('endTransportChange()',s.index('beginTransportChange(TransportOwner.LIVE)'))]
 assert start.index('LossAuthority.open(')<start.index('val liveUploader = Uploader(')<start.index('config = cfg')<start.index('uploader = liveUploader')
 print('PASS source guard: throwing authority/reconciliation/uploader construction precedes config publication',flush=True)
-identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun')
+identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun').replace('noinline onSubmitted','onSubmitted')
 if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected, d)')
 end=block(s,'val endAdmission = synchronized(identityWriteLock)').replace('return@guard','return')
 q=read('queue/QueueKeyStores.kt');sweep=block(q,'fun clearOwnedFrameFiles(')
@@ -44,7 +44,7 @@ class Subject {
  fun takePreF6Dropped()=emptyMap<String,Int>()
  fun returnPreF6DroppedMap(d:Map<String,Int>) {}
  fun bindPreF6Dropped(e:String,d:Map<String,Int>) {}
- fun enqueue(r:Envelope.Record) {}
+ fun enqueue(r:Envelope.Record)=true
  fun identify(user:String)=synchronized(identityWriteLock){identity=identity?.copy(userId=user)}
  fun replace(id:Envelope.SessionIdentity?)=synchronized(identityWriteLock){identity=id}
 '''+identity+'''
@@ -85,7 +85,11 @@ fun main() {
  check(s.enqueueDisclosing(initial){_,_->error("stale-session builder executed")}==Subject.EnqueueAdmission.NO_SESSION);check(s.sequence==before)
  s.replace(null);s.enqueueDisclosing(initial){_,_->error("no-session builder executed")}
  s.replace(initial.copy(projectId="project-b"));s.enqueueDisclosing(initial){_,_->error("foreign-project builder executed")}
- println("PASS old session, no session and foreign project refuse before allocation")
+ var moved=false
+ s.replace(initial.copy(sessionId="session-b"))
+ check(s.enqueueDisclosing(initial,onSubmitted={moved=true}){_,_->error("stale builder executed")}==Subject.EnqueueAdmission.NO_SESSION);check(!moved)
+ check(s.enqueueDisclosing(s.identity!!,onSubmitted={moved=true}){_,_->Envelope.Record("ok")}==Subject.EnqueueAdmission.SUBMITTED);check(moved)
+ println("PASS old session, no session and foreign project refuse before allocation; admission callback runs only on SUBMITTED")
  s.replace(initial)
  val attempted=CountDownLatch(1)
  val stale=Thread { attempted.countDown(); s.claimEnd() }

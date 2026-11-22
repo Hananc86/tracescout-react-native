@@ -8,6 +8,9 @@ import org.junit.Assert.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import com.tracescout.mobile.internal.loss.LossAuthority
+import com.tracescout.mobile.queue.DurableReplace
+import javax.crypto.KeyGenerator
 
 class Pr3InteractionAdmissionTest {
     @Test fun actualHostGatePausedBeforeEmissionRejectsSessionReplacementTruthfully() {
@@ -36,6 +39,38 @@ class Pr3InteractionAdmissionTest {
         } finally {
             resume.countDown();worker?.join(5000)
             fields.forEach{(name,f)->f.set(TraceScoutMobile,prior[name])}
+        }
+    }
+
+    /** First start publishes the authority before `config`. A producer in that
+     * window holds a real sequence while `enqueue` schedules nothing: the host
+     * must not be told `Recorded`, and a refused navigation must not move the route. */
+    @Test fun allocatedSequenceWithoutScheduledAppendIsRefusedAndLeavesRouteUnchanged() {
+        fun field(name:String)=TraceScoutMobile::class.java.getDeclaredField(name).apply{isAccessible=true}
+        val names=listOf("identity","hostInteractionsEnabled","interactionScreen","authority","config")
+        val fields=names.associateWith{field(it)};val prior=fields.mapValues{it.value.get(TraceScoutMobile)}
+        val dir=java.nio.file.Files.createTempDirectory("pr3-admission").toFile()
+        val sid="ts_1700000000000_cccccccccccc"
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        try {
+            LossAuthority.closeAll()
+            val h=(LossAuthority.open(dir,sid,null,{key},DurableReplace.DirSync{true}) as LossAuthority.Open.Ok).handle
+            val a=Envelope.SessionIdentity("p",sid,"anonymous","test","1","1","app","screen")
+            fields.getValue("identity").set(TraceScoutMobile,a)
+            fields.getValue("hostInteractionsEnabled").setBoolean(TraceScoutMobile,true)
+            fields.getValue("interactionScreen").set(TraceScoutMobile,"screen")
+            fields.getValue("authority").set(TraceScoutMobile,h)
+            fields.getValue("config").set(TraceScoutMobile,null)
+            val before=h.unsettledSequences().size
+            assertEquals(HostInteraction.Decision.Refused(HostInteraction.REFUSED_INTERNAL_ERROR),
+                TraceScoutMobile.recordHostInteraction("tap"))
+            assertEquals("ARRANGE: a real sequence was allocated, so the old sequence test would say SUBMITTED",
+                before+1,h.unsettledSequences().size)
+            assertFalse(TraceScoutMobile.recordNavigation("next"))
+            assertEquals("screen",fields.getValue("interactionScreen").get(TraceScoutMobile))
+        } finally {
+            fields.forEach{(name,f)->f.set(TraceScoutMobile,prior[name])}
+            LossAuthority.closeAll();dir.deleteRecursively()
         }
     }
 }

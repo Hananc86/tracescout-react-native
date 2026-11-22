@@ -29,6 +29,13 @@ refused. It is not a server-acceptance proof.
 and requires a truthful `no_session` refusal. The extracted Kotlin probe also
 checks same-session identify/sequence ordering; its mutation control must fail.
 
+An inherited session with no authority on disk is adopted and bound before its
+first POST (`inheritedSessionWithoutAuthorityBindsBeforePostAndDelivers` checks the
+binding file exists when the request is made). A binding refusal sends nothing and
+does not count toward the no-progress bound. `SUBMITTED` means the append task was
+scheduled, and a refused navigation leaves the interaction route unchanged; the
+stale-session half of that is exercised by the extracted probe's admission callback.
+
 `CommittedRecoveryIntegrationTest` requires the isolated real API/PostgreSQL harness
 in `TraceScout-API/test/mobile-loss-authority-forwarding-db.test.cjs`. Set
 `MLOSS_DB_URL` (synthetic database), `MLOSS_SDK_PROJECT` (Gradle test project),

@@ -214,6 +214,46 @@ class Pr3PipelineRegressionTest {
             LossAuthority.closeAll()
         }
     }
+    private fun owned(seq: Long) = String(rec(seq)).replace("{", "{\"projectId\":\"p\",").toByteArray()
+
+    /** An inherited session with NO authority on disk: the binding is created
+     * before the POST it guards, and the queue head is not held for ever. */
+    @Test fun inheritedSessionWithoutAuthorityBindsBeforePostAndDelivers() {
+        val f=tmp();val q=queue(f);for(seq in 0L..1L)q.append(owned(seq))
+        assertFalse("ARRANGE: no authority exists",LossAuthority.authorityExists(f,sid))
+        val bodies=ArrayList<String>();val boundAtPost=ArrayList<Boolean>()
+        val p=pipeline(f,q,bodies){body ->
+            boundAtPost.add(File(EncryptedAuthorityStore.dirFor(f,sid)!!,"project-owner-v1.digest").isFile);chunkOk(body)}
+        p.upload(q.readAll().records,sid)
+        assertEquals(1,bodies.size);assertFalse(isCarrier(bodies[0]))
+        assertEquals(listOf(true),boundAtPost)
+        assertEquals(0,q.readAll().records.size)
+    }
+    /** Ownership that cannot be established before the POST still refuses, and
+     * a refusal that sent nothing is not a POSTED attempt: once the binding is
+     * possible the same queue image delivers instead of sitting behind the
+     * no-progress bound. */
+    @Test fun bindingRefusalsSendNothingAndDoNotExhaustTheNoProgressBound() {
+        val f=tmp();val q=queue(f);for(seq in 0L..1L)q.append(owned(seq))
+        var allow=false
+        val sink=object: AttributionSink by realSink(f) {
+            override fun projectOwnership(sessionId:String, projectId:String, bindFromRecords:Boolean):Boolean = false
+            override fun adoptForRemoval(sessionId:String, queue:List<ByteArray>, queueTrustworthy:Boolean):AttributionSink.Adoption =
+                AttributionSink.Adoption.Refused("test")
+        }
+        val real=realSink(f)
+        val switching=object: AttributionSink by real {
+            override fun projectOwnership(sessionId:String, projectId:String, bindFromRecords:Boolean):Boolean =
+                if(allow) real.projectOwnership(sessionId,projectId,bindFromRecords) else sink.projectOwnership(sessionId,projectId,bindFromRecords)
+            override fun adoptForRemoval(sessionId:String, queue:List<ByteArray>, queueTrustworthy:Boolean):AttributionSink.Adoption =
+                if(allow) real.adoptForRemoval(sessionId,queue,queueTrustworthy) else sink.adoptForRemoval(sessionId,queue,queueTrustworthy)
+        }
+        val bodies=ArrayList<String>();val p=pipelineWith(f,q,bodies,switching){body -> chunkOk(body)}
+        repeat(12){p.upload(q.readAll().records,sid)}
+        assertEquals("a refusal sends nothing",0,bodies.size);assertEquals(2,q.readAll().records.size)
+        allow=true;p.upload(q.readAll().records,sid)
+        assertEquals(1,bodies.size);assertEquals(0,q.readAll().records.size)
+    }
     @Test fun foreignProjectCarrierNeverPosts() {
         val f=tmp();strand(f,0,6,8);val q=queue(f)
         q.append(String(rec(7)).replace("{", "{\"projectId\":\"foreign\",").toByteArray())
