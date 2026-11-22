@@ -108,3 +108,19 @@ print("PASS actual Swift hierarchy predicate bounds escaped and multi-byte ident
 observer=(r/'ios/TraceScoutRN/RnIncidentObserver.swift').read_text()
 assert 'Thread.current.name' not in observer
 assert 'threadName: Thread.current.isMainThread ? "main" : "background"' in observer
+
+# The actual watchdog generation owner must retire a sleeping old thread.
+s=observer
+print(block('struct WatchdogGeneration {'))
+print(r'''var watchdogEpoch = WatchdogGeneration()
+let retired = watchdogEpoch.begin()
+precondition(watchdogEpoch.accepts(retired))
+watchdogEpoch.cancel()
+precondition(!watchdogEpoch.accepts(retired), "cancelled watchdog remains active")
+let replacement = watchdogEpoch.begin()
+precondition(watchdogEpoch.accepts(replacement))
+precondition(!watchdogEpoch.accepts(retired), "retired watchdog revived after reinstall")
+print("PASS actual Swift watchdog generation retires old threads across reinstall")
+''')
+assert 'let running = watchdogGeneration.accepts(token)' in observer
+assert 'watchdogGeneration.cancel()' in observer

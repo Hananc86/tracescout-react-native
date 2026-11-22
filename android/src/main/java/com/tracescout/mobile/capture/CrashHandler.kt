@@ -45,7 +45,15 @@ class CrashHandler private constructor(
     private val afterAppend: (stored: Boolean, durability: EncryptedEventStore.Durability) -> Unit,
 ) : Thread.UncaughtExceptionHandler {
 
+    // The builder and completion share producer admission state. A second
+    // dying thread must not overwrite that state or wait for the first one.
+    private val capturing = java.util.concurrent.atomic.AtomicBoolean(false)
+
     override fun uncaughtException(t: Thread, e: Throwable) {
+        if (!capturing.compareAndSet(false, true)) {
+            previous?.uncaughtException(t, e)
+            return
+        }
         try {
             // Rule 2 + 3: one pre-shaped append, fsync'd, then get out of the way.
             //
@@ -82,6 +90,8 @@ class CrashHandler private constructor(
             // host's handler from running. An SDK that eats a crash report
             // because its own persistence broke is worse than an SDK that was
             // never installed.
+        } finally {
+            capturing.set(false)
         }
         // Rule 1: always chain.
         previous?.uncaughtException(t, e)

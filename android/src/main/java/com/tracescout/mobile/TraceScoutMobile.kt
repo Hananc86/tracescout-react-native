@@ -30,6 +30,8 @@ import com.tracescout.mobile.queue.evictToFit
 import com.tracescout.mobile.transport.ResponseAction
 import com.tracescout.mobile.transport.Uploader
 import com.tracescout.mobile.transport.backoffMillis
+import kotlin.concurrent.withLock
+import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -190,7 +192,7 @@ object TraceScoutMobile {
      * Admission can perform durable IO. Callers must not enter this lock while
      * holding a queue lock that can call back into identity publication.
      */
-    private val identityWriteLock = Any()
+    private val identityWriteLock = ReentrantLock()
     @Volatile private var store: EncryptedEventStore? = null
     /** The queue home the store belongs to — the identity the pipeline is handed (Slice B). */
     @Volatile private var home: com.tracescout.mobile.queue.QueueHome? = null
@@ -529,7 +531,7 @@ object TraceScoutMobile {
                 pixelRatio = metrics.density.toDouble(),
             ),
         )
-        synchronized(identityWriteLock) {
+        identityWriteLock.withLock {
             identity = newIdentity
             sessionStartedMono = clock.monotonicNanos()
             sessionEndClaim.set(null)
@@ -614,13 +616,13 @@ object TraceScoutMobile {
         when (val e = com.tracescout.mobile.queue.ErasureFlow.resumeAtOpen(app.filesDir, erasureHomeOf(app.filesDir))) {
             is com.tracescout.mobile.queue.ErasureFlow.Outcome.Pending -> {
                 RecoveryTrace.log("start_refused_erasure", "why" to e.reason.take(40))
-                synchronized(identityWriteLock) { identity = null }
+                identityWriteLock.withLock { identity = null }
                 started.set(false)
                 return@guard null
             }
             is com.tracescout.mobile.queue.ErasureFlow.Outcome.Incomplete -> {
                 RecoveryTrace.log("start_refused_erasure", "why" to ("incomplete:" + e.reason).take(40))
-                synchronized(identityWriteLock) { identity = null }
+                identityWriteLock.withLock { identity = null }
                 started.set(false)
                 return@guard null
             }
@@ -1755,9 +1757,9 @@ object TraceScoutMobile {
         return emitted
     }
 
-    private fun publishCaptureRoute(expected: Envelope.SessionIdentity, screenId: String): Boolean = synchronized(identityWriteLock) {
-        val live = identity ?: return@synchronized false
-        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false
+    private fun publishCaptureRoute(expected: Envelope.SessionIdentity, screenId: String): Boolean = identityWriteLock.withLock {
+        val live = identity ?: return@withLock false
+        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@withLock false
         interactionScreen = screenId
         true
     }
@@ -2403,7 +2405,7 @@ object TraceScoutMobile {
         // contain `#`. So this is correct for EVERY session id, not merely for
         // the canonical ones — and on a canonical id (no `#` at all) it is
         // byte-identical to the first-separator read it replaces.
-        val endAdmission = synchronized(identityWriteLock) {
+        val endAdmission = identityWriteLock.withLock {
             val live = identity ?: return@guard SessionEndEmission.NO_SESSION
             val held = sessionEndClaim.get()
             if (held != null && held.substringBeforeLast('#') == live.sessionId)
@@ -2734,7 +2736,7 @@ object TraceScoutMobile {
             // `identityWriteLock` — the one place it is replaced — means the
             // copy is always of the identity that is live AT THE WRITE, so a
             // dead session id can never be resurrected by this path.
-            val applied = synchronized(identityWriteLock) {
+            val applied = identityWriteLock.withLock {
                 val live = identity
                 if (live == null) false
                 else {
@@ -2876,7 +2878,7 @@ object TraceScoutMobile {
         capabilitySupported: Boolean = true,
     ): com.tracescout.mobile.capture.WebViewAttachment.Decision =
         guard("webview") {
-            synchronized(identityWriteLock) {
+            identityWriteLock.withLock {
                 com.tracescout.mobile.capture.WebViewAttachment.attach(
                     webView, segment, policy, identity?.sessionId, capabilitySupported)
             }
@@ -3569,9 +3571,9 @@ object TraceScoutMobile {
     private inline fun enqueueDisclosing(expected: Envelope.SessionIdentity,
         noinline onSubmitted: (() -> Unit)? = null,
         noinline onCommitted: ((Boolean) -> Unit)? = null,
-        build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record): EnqueueAdmission = synchronized(identityWriteLock) {
-        val live = identity ?: return@synchronized EnqueueAdmission.NO_SESSION
-        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized EnqueueAdmission.NO_SESSION
+        build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record): EnqueueAdmission = identityWriteLock.withLock {
+        val live = identity ?: return@withLock EnqueueAdmission.NO_SESSION
+        if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@withLock EnqueueAdmission.NO_SESSION
         val d = takePreF6Dropped()
         val rec = try {
             build(live, d)
@@ -4095,7 +4097,10 @@ object TraceScoutMobile {
             // would upload. `settleAppend` defers that state, so the reopen
             // decides it from what is genuinely on disk.
             if (q >= 0) settleAppend(q, stored, durability)
-        }) { thread, throwable ->
+        }) { thread, throwable -> buildNativeCrashRecord(thread, throwable) }
+    }
+
+    private fun buildNativeCrashRecord(thread: Thread, throwable: Throwable): ByteArray {
             // Built at crash time from ALREADY-BOUNDED inputs: class name and
             // frame strings. The exception MESSAGE is deliberately excluded —
             // application code interpolates values into messages, and a crash
@@ -4108,7 +4113,8 @@ object TraceScoutMobile {
             // already relies on for a refused claim: `CrashHandler` wraps
             // `recordBuilder` in its Rule-1 catch and chains the host handler
             // regardless, so an SDK fault can never swallow the host's crash.
-            val admission = synchronized(identityWriteLock) {
+            if (!identityWriteLock.tryLock()) throw IllegalStateException("crash_identity_busy")
+            val admission = try {
                 val live = identity ?: throw IllegalStateException("crash_no_session")
                 live to admit("mobile_crash").also { q ->
                     if (q < 0) {
@@ -4117,8 +4123,8 @@ object TraceScoutMobile {
                     }
                     crashTicketSequence = q
                 }
-            }
-            Envelope.crash(
+            } finally { identityWriteLock.unlock() }
+            return Envelope.crash(
                 id = admission.first,
                 sequence = admission.second,
                 monotonicNanos = clock.monotonicNanos(),
@@ -4153,7 +4159,7 @@ object TraceScoutMobile {
                         )
                     }
                 },
-                threadName = thread.name,
+                threadName = if (thread === android.os.Looper.getMainLooper().thread) "main" else "background",
                 // Asked of the LOOPER, not of the thread's NAME. A host app can
                 // name any thread "main", and a crash report that decided this
                 // from a string would be reporting the app's choice of label as
@@ -4161,7 +4167,6 @@ object TraceScoutMobile {
                 isMainThread = thread === android.os.Looper.getMainLooper().thread,
                 clock = clock,
             ).bytes
-        }
     }
 
     @Volatile private var crashTicketSequence: Long = -1L
@@ -4480,7 +4485,7 @@ object TraceScoutMobile {
         // had just cleared; see the [identityWriteLock] KDoc for the exact
         // interleaving. The critical section is this one assignment, so the
         // leaf-lock property that makes a deadlock unrepresentable holds.
-        synchronized(identityWriteLock) {
+        identityWriteLock.withLock {
             identity = null
             sessionStartedMono = null
             sessionEndClaim.set(null)

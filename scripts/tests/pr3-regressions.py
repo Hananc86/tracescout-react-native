@@ -28,17 +28,19 @@ if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected,
 flush=block(s,'private fun uploadRaw(records:').replace('private fun','fun')
 if a.mutate_flush:flush=flush.replace('disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED','false')
 route=block(s,'private fun publishCaptureRoute(').replace('private fun','fun')
-if a.mutate_route:route=route.replace('if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false','')
+if a.mutate_route:route=route.replace('if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@withLock false','')
 frame=block(s,'if (frameAdmission != EnqueueAdmission.SUBMITTED)').replace('return@guard','return')
 assert s.index('val frameAdmission = enqueueDisclosing(id, onCommitted =') < s.index('if (frameAdmission != EnqueueAdmission.SUBMITTED)') < s.index('// RASTERIZE on the caller')
 if a.mutate_frame:frame=frame.replace('frameAdmission != EnqueueAdmission.SUBMITTED','false')
 frameCommit=block(s,'if (!metadataCommitted.get())').replace('return@execute','return null')
 if a.mutate_frame_commit:frameCommit=frameCommit.replace('!metadataCommitted.get()', 'false')
-end=block(s,'val endAdmission = synchronized(identityWriteLock)').replace('return@guard','return')
+end=block(s,'val endAdmission = identityWriteLock.withLock').replace('return@guard','return')
 q=read('queue/QueueKeyStores.kt');sweep=block(q,'fun clearOwnedFrameFiles(')
 w=read('queue/RecoveryWorker.kt');metadata=w[w.index('internal fun undeliveredRecordBytes'):w.index('\n        /**',w.index('internal fun undeliveredRecordBytes'))]
 bootstrap=block(w,'private fun bootstrapThenHook').replace('private fun','fun').replace('com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)', 'false /* checkpoint-only bootstrap is exercised by the real JVM worker test */')
-program='''import java.io.File
+outcome=block(w,'internal fun outcomeFor').replace('internal fun','fun').replace('com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)','false')
+program='''import kotlin.concurrent.withLock
+import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -52,7 +54,7 @@ object DurableUploadPipeline {enum class Disposition {EMPTY,F15_CHECKPOINT_RETRY
 object RecoveryWorker {var scheduled=0;fun enqueue(ctx:Context):Boolean {scheduled++;return true}}
 class Subject {
  enum class EnqueueAdmission { SUBMITTED, NO_SESSION, REFUSED }
- val identityWriteLock=Any()
+ val identityWriteLock=java.util.concurrent.locks.ReentrantLock()
  var identity:Envelope.SessionIdentity?=null
  var sequence=0
  val records=mutableListOf<Pair<Int,Envelope.SessionIdentity>>()
@@ -60,8 +62,8 @@ class Subject {
  fun returnPreF6DroppedMap(d:Map<String,Int>) {}
  fun bindPreF6Dropped(e:String,d:Map<String,Int>) {}
  fun enqueue(r:Envelope.Record,onCommitted:((Boolean)->Unit)?=null)=true
- fun identify(user:String)=synchronized(identityWriteLock){identity=identity?.copy(userId=user)}
- fun replace(id:Envelope.SessionIdentity?)=synchronized(identityWriteLock){identity=id}
+ fun identify(user:String)=identityWriteLock.withLock{identity=identity?.copy(userId=user)}
+ fun replace(id:Envelope.SessionIdentity?)=identityWriteLock.withLock{identity=id}
 '''+identity+route+flush+'''
  var appContext:Context?=Context(File("."))
  var nextDisposition=DurableUploadPipeline.Disposition.EMPTY
@@ -93,7 +95,7 @@ object Worker {
  val RECORD_QUEUES=listOf("sdk","rn","flutter")
  var bootstrapHook:((Context)->Boolean)?=null
  var drainHook:((Context)->Outcome)?=null
-'''+metadata+bootstrap+'''\n}
+'''+metadata+bootstrap+outcome+'''\n}
 fun main() {
  val s=Subject(); val initial=Envelope.SessionIdentity("session-a","project-a","user-a");s.replace(initial)
  val read=CountDownLatch(1);val resume=CountDownLatch(1)
@@ -156,7 +158,7 @@ fun main() {
  check(Worker.undeliveredRecordBytes(dir)==0L)
  File(dir,"rn").writeText("queued");check(Worker.undeliveredRecordBytes(dir)==6L)
  Worker.bootstrapHook={true};Worker.drainHook={Worker.Outcome.DONE}
- check(Worker.bootstrapThenHook(Context(dir))!!(Context(dir))==Worker.Outcome.RETRY)
+ repeat(2){check(Worker.outcomeFor(Context(dir))==Worker.Outcome.RETRY)}
  File(dir,"rn").writeText("");check(Worker.undeliveredRecordBytes(dir)==0L)
  Files.createSymbolicLink(File(dir,"sdk").toPath(),File(dir,"sdk").toPath())
  check(Worker.undeliveredRecordBytes(dir)>0L)

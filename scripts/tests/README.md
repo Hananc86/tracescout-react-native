@@ -45,7 +45,7 @@ stale-session half of that is exercised by the extracted probe's admission callb
 
 `CommittedRecoveryIntegrationTest` requires the isolated real API/PostgreSQL harness
 in `TraceScout-API/test/mobile-loss-authority-forwarding-db.test.cjs`. Set
-`MLOSS_DB_URL` (synthetic database), `MLOSS_SDK_PROJECT` (Gradle test project),
+`MLOSS_DB_URL` (synthetic database), `MLOSS_SDK_PROJECT` (this checkout’s `scripts/ci/android`),
 `MLOSS_GRADLE` (Gradle executable), `ANDROID_HOME`, and run that Node suite.
 The fixture starts a loopback-only controller endpoint and executes Kotlin with
 real encrypted files and actual server ACKs: all 6–15 queued, split delivery,
@@ -111,3 +111,8 @@ disjoint views and hidden overlays. `--control` restores the former reverse-inde
 selection and requires the specific coordinate-leak assertion to fail after
 successful compilation. The Swift portable probe also executes the actual backtrace
 parser with an unsymbolicated address and a named symbol.
+
+The integration fault withholds both event-response loss ACKs and the automatic
+empty-carrier ACK until the intended restart. It retains the real server replies
+for duplicate-ACK checks; no synthetic loss ACK is introduced. The Gradle fixture
+stages this integration case only when the harness supplies `RECOVERY_TEST_ENDPOINT`.

@@ -192,7 +192,11 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
                 RecoveryTrace.log("worker_no_hook", "pending_bytes" to bytes)
                 return if (bytes > 0L || com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)) Outcome.RETRY else Outcome.DONE
             }
-            return try { drain(ctx) } catch (_: Throwable) { Outcome.RETRY }
+            return try {
+                val outcome = drain(ctx)
+                if (outcome == Outcome.DONE && undeliveredRecordBytes(ctx.filesDir) > 0L)
+                    Outcome.RETRY else outcome
+            } catch (_: Throwable) { Outcome.RETRY }
         }
 
         /**
@@ -224,12 +228,7 @@ class RecoveryWorker(ctx: Context, params: WorkerParameters) : Worker(ctx, param
             if (pending <= 0L && !com.tracescout.mobile.internal.loss.LossAuthority.hasPendingRecovery(ctx.filesDir)) return null
             val ok = try { boot(ctx) } catch (_: Throwable) { false }
             RecoveryTrace.log("worker_bootstrap", "ok" to ok, "pending_bytes" to pending)
-            val drain = if (ok) drainHook else null
-            return drain?.let { installed -> { context ->
-                val outcome = installed(context)
-                if (outcome == Outcome.DONE && undeliveredRecordBytes(context.filesDir) > 0L)
-                    Outcome.RETRY else outcome
-            } }
+            return if (ok) drainHook else null
         }
 
         /** Enqueue the ONE drain job. Idempotent by construction. */

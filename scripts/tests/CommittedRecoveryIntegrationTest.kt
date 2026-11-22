@@ -57,6 +57,7 @@ class CommittedRecoveryIntegrationTest {
             EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,sync)
         File(dir,"events.jsonl").readLines().forEach { assertTrue(queue.append(it.toByteArray()).stored) }
         var die=true
+        var allowRecoveryAck=false
         val requests=ArrayList<String>()
         val realReplies=ArrayList<String>()
         fun pipeline()=DurableUploadPipeline(
@@ -74,9 +75,10 @@ class CommittedRecoveryIntegrationTest {
                 if(die){die=false;throw DurableUploadPipeline.SimulatedProcessDeath("after_server_commit")}
                 val ack=parser.parseAck(raw)
                 // Fault: the delivery response's loss block is unavailable to the receiver.
-                // Event ACK is the actual server response; empty recovery keeps its real loss ACK.
+                // The automatic empty carrier also loses its reply until the intended restart.
+                // After restart, the empty recovery receives the real server loss ACK.
                 Uploader.Result(ResponseAction.SUCCESS,status,null,ack=ack,
-                    lossAck=if(body.contains("\"events\":[]"))parser.parseLossAck(raw) else null)
+                    lossAck=if(allowRecoveryAck && body.contains("\"events\":[]"))parser.parseLossAck(raw) else null)
             },projectId=project,maxRetries=1,appContext=null,backoffMillis={0L},
             results=object:DurableUploadPipeline.ResultSink{override var last:Uploader.Result?=null},
             quarantine=object:DurableUploadPipeline.QuarantineSink{override fun onQuarantined(count:Int,code:String?){error("unexpected quarantine")}},
@@ -89,6 +91,7 @@ class CommittedRecoveryIntegrationTest {
         pipeline().upload(queue.readAll().records,sid)
         assertEquals(requests[0],requests[1]);assertTrue(queue.readAll().records.isEmpty());assertFrozen()
         LossAuthority.closeAll();QueueHome.forgetForTest();F6CheckpointEmitter.resetForTest()
+        allowRecoveryAck=true
         pipeline().upload(emptyList(),sid)
         h=authority();assertNull("genuine committed loss ACK settles frozen claim",h.pendingCheckpoint())
         admit(h,16);val successor=CheckpointClaim.identity(sid,16,counts,false)

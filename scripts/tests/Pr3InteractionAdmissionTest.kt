@@ -3,6 +3,7 @@ package com.tracescout.mobile
 import com.tracescout.mobile.core.Clock
 import com.tracescout.mobile.emit.Envelope
 import com.tracescout.mobile.capture.interaction.HostInteraction
+import kotlin.concurrent.withLock
 import org.junit.Test
 import org.junit.Assert.*
 import java.util.concurrent.CountDownLatch
@@ -13,6 +14,32 @@ import com.tracescout.mobile.queue.DurableReplace
 import javax.crypto.KeyGenerator
 
 class Pr3InteractionAdmissionTest {
+    @Test fun concurrentCrashHandlersCannotOverwriteOutstandingAdmission() {
+        val dir=java.nio.file.Files.createTempDirectory("pr3-concurrent-crash").toFile()
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val q=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,"queue.bin"),key,1024*1024,
+            com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,DurableReplace.DirSync{true})
+        val previous=Thread.getDefaultUncaughtExceptionHandler()
+        val entered=CountDownLatch(1);val resume=CountDownLatch(1)
+        val builds=java.util.concurrent.atomic.AtomicInteger();val settled=java.util.concurrent.atomic.AtomicInteger()
+        val chained=java.util.concurrent.atomic.AtomicInteger();val errors=AtomicReference<Throwable>()
+        var first:Thread?=null
+        try {
+            Thread.setDefaultUncaughtExceptionHandler{_,_->chained.incrementAndGet()}
+            val handler=com.tracescout.mobile.capture.CrashHandler.install(q,afterAppend={stored,_->if(stored)settled.incrementAndGet()}) {_,_->
+                if(builds.incrementAndGet()==1){entered.countDown();check(resume.await(5,TimeUnit.SECONDS))}
+                "{\"eventType\":\"mobile_crash\"}".toByteArray()
+            }!!
+            first=Thread{try{handler.uncaughtException(Thread.currentThread(),Exception())}catch(t:Throwable){errors.set(t)}}
+            first.start();assertTrue(entered.await(5,TimeUnit.SECONDS))
+            handler.uncaughtException(Thread.currentThread(),Exception())
+            assertEquals("second crash overwrote outstanding admission",1,builds.get())
+            assertEquals("busy crash must still chain immediately",1,chained.get())
+            resume.countDown();first.join(5000);assertFalse(first.isAlive);assertNull(errors.get())
+            assertEquals(1,settled.get());assertEquals(1,q.readAll().records.size);assertEquals(2,chained.get())
+        } finally {resume.countDown();first?.join(5000);Thread.setDefaultUncaughtExceptionHandler(previous);dir.deleteRecursively()}
+    }
+
     @Test fun frameMetadataCompletionReflectsGovernedAppendDurability() {
         fun field(n:String)=TraceScoutMobile::class.java.getDeclaredField(n).apply{isAccessible=true}
         val names=listOf("config","bracket","authority")
@@ -53,10 +80,34 @@ class Pr3InteractionAdmissionTest {
                 val g=com.tracescout.mobile.capture.interaction.GestureLifecycle(10f)
                 fun sample(action:com.tracescout.mobile.capture.interaction.GestureLifecycle.Action,x:Float)=
                     com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(action,0,x,1f,1000000,1)
-                g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,1f),safe)
-                g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.MOVE,2f),restricted)
-                val rows=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,if(swipe)30f else 1f),safe)
+                val rows=ArrayList<com.tracescout.mobile.capture.interaction.GestureLifecycle.Persist>()
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,1f),safe)
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.MOVE,2f),restricted)
+                rows+=g.observe(sample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,if(swipe)30f else 1f),safe)
+                if(restricted.authority()==safe.authority())assertEquals(if(swipe)2 else 1,rows.size)
                 assertTrue("transient restriction leaked positional gesture",rows.all{it.facts.positionTreatment!=com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED})
+            }
+        }
+    }
+
+    @Test fun unrestrictedGesturesAndSampleClocksRemainObservable() {
+        val facts=com.tracescout.mobile.capture.interaction.GestureLifecycle.SampleFacts("screen",false,false,true,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.TargetClass.SAFE,
+            com.tracescout.mobile.capture.interaction.InteractionPolicy.PositionTreatment.ALLOWED,100,100)
+        for(swipe in listOf(false,true)) {
+            val g=com.tracescout.mobile.capture.interaction.GestureLifecycle(10f)
+            val rows=ArrayList<com.tracescout.mobile.capture.interaction.GestureLifecycle.Persist>()
+            rows+=g.observe(com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.DOWN,0,1f,1f,1000000,100),facts)
+            rows+=g.observe(com.tracescout.mobile.capture.interaction.GestureLifecycle.TouchSample(com.tracescout.mobile.capture.interaction.GestureLifecycle.Action.UP,0,if(swipe)30f else 1f,1f,3000000,2100),facts)
+            assertEquals(if(swipe)2 else 1,rows.size)
+            assertEquals(if(swipe)listOf("begin","end")else listOf(null),rows.map{it.phase?.wire})
+            for(row in rows) {
+                val emission=(com.tracescout.mobile.capture.interaction.InteractionProducer.produce(row) as com.tracescout.mobile.capture.interaction.InteractionProducer.Result.Emit).emission
+                val record=Envelope.interaction(Envelope.SessionIdentity("p","s","a","test","1","1","app","screen"),0,com.tracescout.mobile.privacy.Posture(),emission,
+                    clock=object:Clock{override fun monotonicNanos()=999L;override fun wallMillis()=99999L})
+                val json=org.json.JSONObject(String(record.bytes))
+                assertEquals(row.sample.wallMillis,json.getLong("timestamp"))
+                assertEquals(row.sample.monotonicNanos,json.getLong("monotonicNanos"))
             }
         }
     }
@@ -80,7 +131,7 @@ class Pr3InteractionAdmissionTest {
             worker=Thread{result.set(TraceScoutMobile.recordHostInteraction("tap"))};worker.start()
             assertTrue(gate.await(5,TimeUnit.SECONDS))
             val ownerLock=field("identityWriteLock").get(TraceScoutMobile)
-            synchronized(ownerLock){fields.getValue("identity").set(TraceScoutMobile,a.copy(sessionId="session-b"))}
+            (ownerLock as java.util.concurrent.locks.ReentrantLock).withLock{fields.getValue("identity").set(TraceScoutMobile,a.copy(sessionId="session-b"))}
             resume.countDown();worker.join(5000);assertFalse(worker.isAlive)
             assertEquals(HostInteraction.Decision.Refused(HostInteraction.REFUSED_NO_SESSION),result.get())
             assertEquals("session-b",(fields.getValue("identity").get(TraceScoutMobile) as Envelope.SessionIdentity).sessionId)

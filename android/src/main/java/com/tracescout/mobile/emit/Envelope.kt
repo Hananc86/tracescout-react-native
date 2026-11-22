@@ -1261,6 +1261,7 @@ object Envelope {
                 // The carrier was decided by `InteractionCapture.carrierFor`
                 // against the hit test; this composes, it does not decide.
                 clock, "foreground", emission.screenId, webView?.segmentId, null, null, dropped,
+                wallMillis = emission.wallMillis,
                 webViewBrowserPrivacyStatus = webView?.browserPrivacyStatus,
             ) + com.tracescout.mobile.capture.interaction.InteractionProducer.payloadFields(emission))
                 .toTypedArray()

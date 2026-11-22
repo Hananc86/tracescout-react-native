@@ -196,6 +196,40 @@ class Pr3PipelineRegressionTest {
     )
 
 
+    @Test fun emptyCheckpointRecoveryHonorsErasureRequest() {
+        for(unreadable in listOf(false,true)) {
+            val f=tmp();val h=strand(f,0,6,8);val q=queue(f)
+            assertTrue(realSink(f).projectOwnership(sid,"p",true));val frozen=snapshot(h.pendingCheckpoint())
+            val home=QueueHome.of(q.backingFile()){q}
+            val file=File(home.erasure().path())
+            if(unreadable){file.parentFile.mkdirs();file.writeText("unreadable")}
+            else assertEquals(com.tracescout.mobile.queue.ErasureRequest.Write.Committed,
+                com.tracescout.mobile.queue.ErasureRequest(file,yes).install(com.tracescout.mobile.queue.ErasureRequest.Record(1,
+                    com.tracescout.mobile.queue.ErasureRequest.PHASE_REQUESTED,null)))
+            var posts=0
+            val p=pipeline(f,q,ArrayList()){posts++;Uploader.Result(ResponseAction.RETRY,503,"unexpected")}
+            p.upload(emptyList(),sid)
+            assertEquals("erasure allowed pending telemetry",0,posts)
+            assertEquals(DurableUploadPipeline.Disposition.ERASURE_REQUESTED,p.disposition)
+            assertEquals(frozen,snapshot(h.pendingCheckpoint()))
+        }
+    }
+
+    @Test fun everyWorkerAttemptRetainsOtherProducerQueue() {
+        val f=tmp();val file=File(f,com.tracescout.mobile.queue.QueueKeyStores.RN_QUEUE).apply{writeText("records")}
+        val ctx=object:android.content.ContextWrapper(null){override fun getFilesDir()=f}
+        val worker=com.tracescout.mobile.queue.RecoveryWorker
+        val oldDrain=worker.drainHook;val oldBoot=worker.bootstrapHook
+        try {
+            var boots=0;var drains=0
+            worker.drainHook=null;worker.bootstrapHook={boots++;worker.drainHook={drains++;com.tracescout.mobile.queue.RecoveryWorker.Outcome.DONE};true}
+            repeat(2){assertEquals("worker forgot cross-queue obligation on attempt $it",com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,worker.outcomeFor(ctx))}
+            assertEquals(1,boots);assertEquals(2,drains)
+            file.writeText("")
+            assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.DONE,worker.outcomeFor(ctx))
+        } finally {worker.drainHook=oldDrain;worker.bootstrapHook=oldBoot}
+    }
+
     @Test fun foreignPrefixIsPreservedBeforeCurrentProjectDrains() {
         val f=tmp();val h=strand(f,0,6,7);val frozen=snapshot(h.pendingCheckpoint())
         val q=queue(f);val foreign=String(rec(7)).replace("{","{\"projectId\":\"foreign\",").toByteArray()
@@ -282,6 +316,23 @@ class Pr3PipelineRegressionTest {
         // an unreconciled handle that can accept PREPARED admissions is not.
         assertTrue("producer admitted through read-only handle",producer==null || producer.reconciledWithQueue)
         assertNull(readonly.pendingCheckpoint())
+    }
+
+    @Test fun nativeBusyIdentityGateStillChainsHostCrashHandler() {
+        val native=com.tracescout.mobile.TraceScoutMobile
+        val gate=native.javaClass.getDeclaredField("identityWriteLock").apply{isAccessible=true}.get(native) as java.util.concurrent.locks.ReentrantLock
+        val builder=native.javaClass.getDeclaredMethod("buildNativeCrashRecord",Thread::class.java,Throwable::class.java).apply{isAccessible=true}
+        val chained=java.util.concurrent.CountDownLatch(1)
+        val ctor=com.tracescout.mobile.capture.CrashHandler::class.java.declaredConstructors.first{it.parameterCount==4}.apply{isAccessible=true}
+        val build:(Thread,Throwable)->ByteArray={t,e->builder.invoke(native,t,e) as ByteArray}
+        val settled:(Boolean,EncryptedEventStore.Durability)->Unit={_,_->error("busy crash must not append")}
+        val q=queue(tmp())
+        val handler=ctor.newInstance(q,Thread.UncaughtExceptionHandler{_,_->chained.countDown()},build,settled) as Thread.UncaughtExceptionHandler
+        val crash=Thread{handler.uncaughtException(Thread.currentThread(),Exception())}
+        gate.lock()
+        try {crash.start();assertTrue("native host handler blocked on identity",chained.await(1,java.util.concurrent.TimeUnit.SECONDS))}
+        finally {gate.unlock();crash.join(5000)}
+        assertFalse(crash.isAlive);assertTrue(q.readAll().records.isEmpty())
     }
 
     @Test fun busyIdentityGateStillChainsHostCrashHandler() {

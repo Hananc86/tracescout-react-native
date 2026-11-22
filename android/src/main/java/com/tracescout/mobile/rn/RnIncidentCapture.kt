@@ -184,6 +184,7 @@ object RnIncidentCapture {
             RecoveryTrace.log("rn_crash_install_failed", "code" to t.javaClass.simpleName)
             return
         }
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
         val handler = CrashHandler.install(
             store,
             afterAppend = { stored, durability ->
@@ -213,10 +214,9 @@ object RnIncidentCapture {
         // as native ones. That is the correct conflict resolution (one handler,
         // first writer wins, the host's own handler still chains) but it must
         // be VISIBLE rather than look like a successful install.
-        if (!handler.javaClass.name.startsWith("com.tracescout.mobile.capture.CrashHandler")) {
+        if (handler === previous) {
             RecoveryTrace.log("rn_crash_install_foreign", "class" to handler.javaClass.name)
-        }
-        RecoveryTrace.log("rn_crash_installed")
+        } else RecoveryTrace.log("rn_crash_installed")
     }
 
     /**

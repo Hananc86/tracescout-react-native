@@ -56,7 +56,15 @@ public enum RnIncidentObserver {
     private static var installedFlag = false
     private static var hangThresholdMs: Int = 3_000
     private static var watchdog: Thread?
-    private static var watchdogRunning = false
+    struct WatchdogGeneration {
+        private var next: UInt64 = 0
+        private var active: UInt64?
+        mutating func begin() -> UInt64 { next &+= 1; active = next; return next }
+        mutating func cancel() { active = nil }
+        func accepts(_ token: UInt64) -> Bool { active == token }
+        func current() -> UInt64? { active }
+    }
+    private static var watchdogGeneration = WatchdogGeneration()
 
     /// Bumped by the MAIN thread, read by the watchdog. The watchdog only ever
     /// reads; the main thread only ever writes.
@@ -128,6 +136,7 @@ public enum RnIncidentObserver {
         installedFlag = true
         context = ctx
         hangThresholdMs = ms
+        let watchdogToken = watchdogGeneration.begin()
         // CAPTURED BEFORE WE REPLACE IT. Reading it afterwards would return
         // our own handler and the chain would be a self-reference.
         previousHandler = NSGetUncaughtExceptionHandler()
@@ -147,7 +156,7 @@ public enum RnIncidentObserver {
                 [("why", "threshold_below_floor"), ("thresholdMs", String(ms))])
             return true
         }
-        startHangWatchdog(thresholdMs: ms)
+        startHangWatchdog(thresholdMs: ms, token: watchdogToken)
         RecoveryTrace.shared.log("rn_hang_installed", [("thresholdMs", String(ms))])
         return true
     }
@@ -159,7 +168,7 @@ public enum RnIncidentObserver {
         installedFlag = false
         previousHandler = nil
         context = nil
-        watchdogRunning = false
+        watchdogGeneration.cancel()
         heartbeatTimer?.cancel()
         heartbeatTimer = nil
         watchdog = nil
@@ -253,20 +262,20 @@ public enum RnIncidentObserver {
 
     // ── hang ─────────────────────────────────────────────────────────────────
 
-    private static func startHangWatchdog(thresholdMs ms: Int) {
+    private static func startHangWatchdog(thresholdMs ms: Int, token: UInt64) {
         lock.lock()
-        watchdogRunning = true
-        lock.unlock()
+        defer { lock.unlock() }
+        guard installedFlag, watchdogGeneration.accepts(token) else { return }
 
         // The main thread's ONLY job: bump a counter. No allocation, no I/O,
         // nothing that can itself contribute to a hang.
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now(), repeating: .milliseconds(200))
         t.setEventHandler {
-            lock.lock(); heartbeat &+= 1; lock.unlock()
+            lock.lock(); if watchdogGeneration.accepts(token) { heartbeat &+= 1 }; lock.unlock()
         }
         t.resume()
-        lock.lock(); heartbeatTimer = t; lock.unlock()
+        heartbeatTimer = t
 
         let w = Thread {
             var lastSeen: Int64 = -1
@@ -274,7 +283,7 @@ public enum RnIncidentObserver {
             var reportedForThisStall = false
             while true {
                 lock.lock()
-                let running = watchdogRunning
+                let running = watchdogGeneration.accepts(token)
                 let beat = heartbeat
                 lock.unlock()
                 if !running { return }
@@ -295,7 +304,7 @@ public enum RnIncidentObserver {
                        IncidentPolicy.hangIsEmittable(blockedMs: Double(blockedMs),
                                                       thresholdMs: Double(ms)) {
                         reportedForThisStall = true
-                        emitHang(blockedMs: blockedMs, thresholdMs: ms)
+                        emitHang(blockedMs: blockedMs, thresholdMs: ms, token: token)
                     }
                 }
                 Thread.sleep(forTimeInterval: 0.2)
@@ -305,14 +314,15 @@ public enum RnIncidentObserver {
         // Below default so the watchdog cannot itself compete for the CPU the
         // main thread is waiting on.
         w.qualityOfService = .utility
-        lock.lock(); watchdog = w; lock.unlock()
+        watchdog = w
         w.start()
     }
 
     /// Runs on the WATCHDOG thread of a LIVE process — so unlike the crash path
     /// it takes the ordinary enqueue and asks for a drain.
-    private static func emitHang(blockedMs: Int, thresholdMs: Int) {
+    private static func emitHang(blockedMs: Int, thresholdMs: Int, token: UInt64) {
         lock.lock()
+        guard watchdogGeneration.accepts(token) else { lock.unlock(); return }
         let ctx = context
         lock.unlock()
         guard let ctx = ctx, let id = ctx.identity() else { return }
@@ -429,7 +439,9 @@ public enum RnIncidentObserver {
 
     /// Drive the hang path at a chosen duration, same reasoning as above.
     static func __testEmitHang(blockedMs: Int, thresholdMs: Int) {
-        emitHang(blockedMs: blockedMs, thresholdMs: thresholdMs)
+        lock.lock(); let token = watchdogGeneration.current(); lock.unlock()
+        guard let token = token else { return }
+        emitHang(blockedMs: blockedMs, thresholdMs: thresholdMs, token: token)
     }
 
     /// Is a chain target recorded? Pinned by a test: an SDK that swallowed the

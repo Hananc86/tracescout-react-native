@@ -982,6 +982,11 @@ class DurableUploadPipeline(
         drainPosted = 0; drainProgressed = false; drainEpoch = ""
         // A pre-POST refusal still owns queued work; only a proven empty image may clear it.
         disposition = if (records.isEmpty()) Disposition.EMPTY else Disposition.RETRYABLE_REMAINING
+        if (home.erasure().presentOrUnreadable()) {
+            results.last = localRefusal("erasure_requested")
+            disposition = Disposition.ERASURE_REQUESTED
+            return@synchronized
+        }
         var died = false
         try {
             uploadInner(records, fallbackSessionId)
@@ -994,6 +999,11 @@ class DurableUploadPipeline(
     }
 
     private fun recoverEmpty(fallbackSessionId: String) {
+        if (home.erasure().presentOrUnreadable()) {
+            results.last = localRefusal("erasure_requested")
+            disposition = Disposition.ERASURE_REQUESTED
+            return
+        }
         RecoveryTrace.log("upload_empty_noop"); results.last = null
         disposition = Disposition.EMPTY
         // F7 R-2 — THE ONE PRODUCTION TRIGGER, and it
@@ -2908,6 +2918,7 @@ class DurableUploadPipeline(
         transportEvent: String,
         unackEvent: String,
     ): MetadataOnly {
+        if (home.erasure().presentOrUnreadable()) return MetadataOnly.NotSent("erasure_requested")
         // A later session in the queue is not vouched for by the bootstrap's
         // first-prefix check. Read ownership before constructing any carrier bytes.
         val records = try { store.readRecords() } catch (t: Throwable) {
