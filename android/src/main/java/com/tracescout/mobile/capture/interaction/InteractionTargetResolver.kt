@@ -149,9 +149,14 @@ object InteractionTargetResolver {
             (cls == InputType.TYPE_CLASS_NUMBER && variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD)
     }
 
-    private val loc = IntArray(2)
     private fun contains(v: View, x: Float, y: Float): Boolean {
-        v.getLocationOnScreen(loc)
-        return x >= loc[0] && x < loc[0] + v.width && y >= loc[1] && y < loc[1] + v.height
+        // Android maps child/ancestor transforms and clipping into root bounds.
+        // Convert those bounds to the screen coordinates supplied by raw touch.
+        val bounds = android.graphics.Rect()
+        if (!v.getGlobalVisibleRect(bounds)) return false
+        val rootLocation = IntArray(2)
+        v.rootView.getLocationOnScreen(rootLocation)
+        return x >= bounds.left + rootLocation[0] && x < bounds.right + rootLocation[0] &&
+            y >= bounds.top + rootLocation[1] && y < bounds.bottom + rootLocation[1]
     }
 }

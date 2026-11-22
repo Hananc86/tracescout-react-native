@@ -55,7 +55,11 @@ def read(rel):
     return open(p, encoding='utf-8').read()
 
 
-src_m, src_swift, src_kt, src_ts = (read(f) for f in (M, SWIFT, KT, TS))
+def code_only(source, mask_strings=True):
+    return re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
+                  lambda m: ('""' if mask_strings else m.group()) if m.group().startswith('"') else ' ', source, flags=re.S)
+
+src_m, src_swift, src_kt, src_ts = (code_only(read(f), False) for f in (M, SWIFT, KT, TS))
 
 # --- the four derivations -------------------------------------------------
 # Whitespace is tolerated everywhere a compiler tolerates it. A matcher that
@@ -121,12 +125,24 @@ check('C2', len(macros) == len(objc),
 # --- every declared method is reachable from the package's own wrapper ----
 # A name in the interface that no exported function forwards is a method a
 # consumer can see in the types and cannot call.
+miswired = []
 for n in ts:
-    if not re.search(r'^export function\s+' + re.escape(n) + r'\s*\(', src_ts, re.M):
-        check('D1', False, f'`{n}` is declared in NativeBridge but no exported wrapper calls it')
-        break
-else:
-    check('D1', True, f'all {len(ts)} declared methods have an exported wrapper')
+    wrapper = re.search(r'export function\s+' + re.escape(n) +
+                        r'\s*\((.*?)\)\s*:\s*Promise<[^>]+>\s*\{(.*?)^\}', src_ts, re.S | re.M)
+    if not wrapper:
+        miswired.append(n)
+        continue
+    parameters = [re.match(r'\s*(\w+)', p).group(1)
+                  for p in wrapper.group(1).split(',') if p.strip()]
+    call = re.search(r"return\s+call\(\s*['\"](\w+)['\"]\s*(?:,\s*(.*?))?\);", wrapper.group(2), re.S)
+    arguments = [p.strip() for p in (call.group(2) or '').split(',') if p.strip()] if call else []
+    direct = re.search(r'return\s+native\.(\w+)\(([^)]*)\)', wrapper.group(2))
+    direct_args = [p.strip() for p in direct.group(2).split(',') if p.strip()] if direct else []
+    forwarded = bool(call and call.group(1) == n and arguments == parameters)
+    forwarded = forwarded or bool(direct and direct.group(1) == n and direct_args == parameters)
+    if not forwarded:
+        miswired.append(n)
+check('D1', not miswired, f'wrappers forward to their named native method with every argument in order; miswired: {miswired or "none"}')
 
 default_block = re.search(r'export default \{(.*?)\n\};', src_ts, re.S)
 
@@ -163,9 +179,6 @@ check('F0', bool(needed_kt) and bool(needed_swift),
 
 # Require a non-null argument, ignoring comments and literal contents. A name
 # followed by '=' alone also accepts the disabled value null/nil.
-def code_only(source):
-    return re.sub(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*',
-                  lambda m: '""' if m.group().startswith('"') else ' ', source, flags=re.S)
 
 missing_kt = [d for d in needed_kt
               if not re.search(r'\b' + re.escape(d) + r'\s*=\s*(?!null\b)(?=[{A-Za-z_])', code_only(src_kt))]

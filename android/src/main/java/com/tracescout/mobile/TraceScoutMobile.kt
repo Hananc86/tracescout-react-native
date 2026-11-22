@@ -803,8 +803,9 @@ object TraceScoutMobile {
                     // F7 R-2 (#2760): drain first, then classify — an EMPTY
                     // drain is the one moment no chunk can carry a disclosure,
                     // and the pipeline owns that decision.
-                    reachedPipeline = uploadRaw(recs)
-                    if (!reachedPipeline || lastPipelineDisposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) -1
+                    var disposition = DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
+                    reachedPipeline = uploadRawWithOutcome(recs) { disposition = it }
+                    if (!reachedPipeline || disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) -1
                     else if (recs.isEmpty()) 0
                     else store?.readAll().let { r ->
                         if (r == null || r.couldNotBeRead) -1 else r.records.size
@@ -1275,8 +1276,9 @@ object TraceScoutMobile {
                     // a host that declared the session over and was then killed
                     // emits the checkpoint on the next launch. Asked while this
                     // process still holds the recovery lease.
-                    val reached = uploadRaw(records)
-                    if (!reached || lastPipelineDisposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) {
+                    var disposition = DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
+                    val reached = uploadRawWithOutcome(records) { disposition = it }
+                    if (!reached || disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) {
                         RecoveryCoordinator.status = RecoveryCoordinator.Status.RECOVERY_RETRIABLE_FAILURE
                         RecoveryWorker.enqueue(app)
                     } else RecoveryWorker.cancel(app)
@@ -3105,10 +3107,11 @@ object TraceScoutMobile {
         try { openParkStore().status() }
         catch (_: Throwable) { com.tracescout.mobile.internal.queue.ParkStatus(0, 0, 0L) }
 
-    @Volatile private var lastPipelineDisposition = DurableUploadPipeline.Disposition.EMPTY
+    private fun uploadRaw(records: List<ByteArray>): Boolean = uploadRawWithOutcome(records) { }
 
-    private fun uploadRaw(records: List<ByteArray>): Boolean {
-        lastPipelineDisposition = DurableUploadPipeline.Disposition.RETRYABLE_REMAINING
+    // The result belongs to this invocation; concurrent drains cannot replace it.
+    private fun uploadRawWithOutcome(records: List<ByteArray>, outcome: (DurableUploadPipeline.Disposition) -> Unit): Boolean {
+        outcome(DurableUploadPipeline.Disposition.RETRYABLE_REMAINING)
         // OPEN OF THE TRANSPORT SEQLOCK — see [transportEpoch]. The four
         // fields below are independent, so reading them one at a time can
         // compose half of one entry point's transport with half of another's.
@@ -3236,7 +3239,7 @@ object TraceScoutMobile {
             reconciler = com.tracescout.mobile.internal.queue.QueueReconciler(h, app.filesDir, inflightStoreOf(app)),
         )
         pipeline.upload(records, fallbackSessionId)
-        lastPipelineDisposition = pipeline.disposition
+        outcome(pipeline.disposition)
         return true
     }
 

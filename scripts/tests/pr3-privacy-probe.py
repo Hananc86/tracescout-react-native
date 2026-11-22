@@ -13,7 +13,9 @@ open class View {
  companion object { const val VISIBLE=0 }
  var visibility=VISIBLE; var tag:Any?=null; var parent:Any?=null
  var layoutParams:Any?=null; var width=100; var height=100; var left=0; var top=0
- var elevation=0f
+ var elevation=0f;var scaleX=1f
+ val rootView:View get()=(parent as? View)?.rootView ?: this
+ fun getGlobalVisibleRect(r:android.graphics.Rect):Boolean {r.left=left;r.top=top;r.right=left+(width*scaleX).toInt();r.bottom=top+height;return visibility==VISIBLE}
  fun findFocus():View?=null
  open fun onCheckIsTextEditor()=false
  fun getLocationOnScreen(loc:IntArray) {loc[0]=left;loc[1]=top}
@@ -25,6 +27,7 @@ open class ViewGroup:View() {
 }
 object WindowManager { class LayoutParams {var flags=0;companion object{const val FLAG_SECURE=8192}} }
 ''',
+    'Rect.kt': 'package android.graphics\nclass Rect {var left=0;var top=0;var right=0;var bottom=0}',
     'WebView.kt': 'package android.webkit\nopen class WebView:android.view.ViewGroup()',
     'EditText.kt': 'package android.widget\nclass EditText:android.view.View(){var inputType=0}',
     'InputType.kt': '''package android.text
@@ -50,6 +53,8 @@ fun main() {
  check(Resolver.resolve(root,10f,10f).positionTreatment==Treatment.ALLOWED) {"unambiguous safe view was disabled"}
  blocked.left=0;blocked.visibility=8
  check(Resolver.resolve(root,10f,10f).positionTreatment==Treatment.ALLOWED)
+ root.width=300;safe.left=100;blocked.visibility=View.VISIBLE;blocked.scaleX=2f
+ check(Resolver.resolve(root,150f,50f).positionTreatment==Treatment.BLOCKED) {"scaled blocked overlay leaked coordinates"}
  println("PASS actual resolver: elevated/reordered overlap blocked; disjoint/hidden overlay preserves safe capture")
 }
 ''',
@@ -66,6 +71,14 @@ if '--control' in sys.argv:
                 if (c.visibility == View.VISIBLE && contains(c, x, y)) { next = c; break }
             }
 """ + resolver[end:]
+if '--unscaled-control' in sys.argv:
+    start = resolver.index('    private fun contains(')
+    resolver = resolver[:start] + """    private fun contains(v: View, x: Float, y: Float): Boolean {
+        val loc=IntArray(2);v.getLocationOnScreen(loc)
+        return x >= loc[0] && x < loc[0] + v.width && y >= loc[1] && y < loc[1] + v.height
+    }
+}
+"""
 (out / 'InteractionTargetResolver.kt').write_text(resolver)
 lib = root / 'scripts/ci/android/build/probe-compiler'
 stdlib = next(lib.glob('kotlin-stdlib-[0-9]*.jar'))
@@ -75,8 +88,9 @@ subprocess.run(['java', '-Xmx512m', '-cp', str(lib / '*'), 'org.jetbrains.kotlin
                 *map(str, out.glob('*.kt')), str(base / 'InteractionPolicy.kt')], check=True)
 result = subprocess.run(['java', '-cp', f'{jar}:{stdlib}', 'ProbeKt'], text=True, capture_output=True)
 print(result.stdout + result.stderr)
-if '--control' in sys.argv:
-    assert result.returncode != 0 and 'elevated blocked overlay leaked coordinates' in result.stderr
+if '--control' in sys.argv or '--unscaled-control' in sys.argv:
+    expected = 'scaled blocked overlay leaked coordinates' if '--unscaled-control' in sys.argv else 'elevated blocked overlay leaked coordinates'
+    assert result.returncode != 0 and expected in result.stderr
     print('PASS old production resolver fails the privacy regression')
 else:
     result.check_returncode()

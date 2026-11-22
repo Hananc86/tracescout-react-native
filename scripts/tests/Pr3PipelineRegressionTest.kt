@@ -20,6 +20,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -176,6 +177,7 @@ class Pr3PipelineRegressionTest {
         park: ParkStore = ParkStore.none(),
         quar: Quar = Quar(),
         mono: Mono = Mono(),
+        faults: (String) -> Unit = {},
         respond: (String) -> Uploader.Result,
     ): DurableUploadPipeline = DurableUploadPipeline(
         home = QueueHome.of(q.backingFile()) { q },
@@ -189,12 +191,13 @@ class Pr3PipelineRegressionTest {
         attribution = sink,
         park = park,
         monotonicNanos = mono,
+        faults = faults,
     )
 
 
     @Test fun foreignPrefixIsPreservedBeforeCurrentProjectDrains() {
-        val f=tmp();val h=strand(f,0,0,0);val frozen=snapshot(h.pendingCheckpoint())
-        val q=queue(f);val foreign=String(rec(0)).replace("{","{\"projectId\":\"foreign\",").toByteArray()
+        val f=tmp();val h=strand(f,0,6,7);val frozen=snapshot(h.pendingCheckpoint())
+        val q=queue(f);val foreign=String(rec(7)).replace("{","{\"projectId\":\"foreign\",").toByteArray()
         val current=String(rec(0,other)).replace("{","{\"projectId\":\"p\",").toByteArray()
         q.append(foreign);q.append(current)
         val kept=ArrayList<ByteArray>();val entries=ArrayList<ParkedBatch>()
@@ -224,10 +227,49 @@ class Pr3PipelineRegressionTest {
         assertEquals(4,bodies.size);assertNotNull(authority(f).pendingCheckpoint())
     }
 
+    @Test fun producerCannotReuseReadOnlyAuthorityWithoutQueueReconciliation() {
+        val f=tmp();val readonly=authority(f);assertFalse(readonly.reconciledWithQueue)
+        val q=queue(f)
+        val app=object:android.content.ContextWrapper(null){override fun getFilesDir()=f}
+        val method=com.tracescout.mobile.rn.RnTransport::class.java.getDeclaredMethod("authorityFor",
+            android.content.Context::class.java,String::class.java,EncryptedEventStore::class.java).apply{isAccessible=true}
+        val producer=method.invoke(com.tracescout.mobile.rn.RnTransport,app,sid,q) as LossAuthority.Handle?
+        // No Android Keystore exists in this JVM: refusing is valid, returning
+        // an unreconciled handle that can accept PREPARED admissions is not.
+        assertTrue("producer admitted through read-only handle",producer==null || producer.reconciledWithQueue)
+        assertNull(readonly.pendingCheckpoint())
+    }
+
+    @Test fun busyIdentityGateStillChainsHostCrashHandler() {
+        val lock=java.util.concurrent.locks.ReentrantLock()
+        val provider=object:com.tracescout.mobile.rn.RnIncidentCapture.Context2 {
+            override val identityLock=lock
+            override fun identity():com.tracescout.rn.RnEnvelope.Identity?=error("busy gate must refuse before callbacks")
+            override fun posture()=com.tracescout.rn.RnEnvelope.Posture(allowedViewCount=0,screenNeverRecord=false)
+            override fun screenId():String?=null
+        }
+        val builder=com.tracescout.mobile.rn.RnIncidentCapture::class.java.getDeclaredMethod("buildCrashRecord",
+            android.content.Context::class.java,com.tracescout.mobile.rn.RnIncidentCapture.Context2::class.java,
+            Thread::class.java,Throwable::class.java).apply{isAccessible=true}
+        val chained=java.util.concurrent.CountDownLatch(1)
+        val ctor=com.tracescout.mobile.capture.CrashHandler::class.java.declaredConstructors.first{it.parameterCount==4}.apply{isAccessible=true}
+        val build:(Thread,Throwable)->ByteArray={t,e->builder.invoke(com.tracescout.mobile.rn.RnIncidentCapture,android.content.ContextWrapper(null),provider,t,e) as ByteArray}
+        val settled:(Boolean,EncryptedEventStore.Durability)->Unit={_,_->error("refused crash must not append")}
+        val q=queue(tmp())
+        val handler=ctor.newInstance(q,Thread.UncaughtExceptionHandler{_,_->chained.countDown()},build,settled) as Thread.UncaughtExceptionHandler
+        val crash=Thread{handler.uncaughtException(Thread.currentThread(),Exception("synthetic"))}
+        lock.lock()
+        try {crash.start();assertTrue("host handler blocked on SDK identity gate",chained.await(1,java.util.concurrent.TimeUnit.SECONDS))}
+        finally {lock.unlock();crash.join(5000)}
+        assertFalse(crash.isAlive);assertTrue(q.readAll().records.isEmpty())
+    }
+
     @Test fun rnDrainDiscoversCheckpointWithoutFinalizedSession() = checkpointOnlyDrain(false)
     @Test fun nativeWorkerRetainsCheckpointOnlyRetry() = checkpointOnlyDrain(true)
 
-    private fun checkpointOnlyDrain(native:Boolean) {
+    @Test fun nativeDrainOutcomeBelongsToItsInvocation() = checkpointOnlyDrain(true, true)
+
+    private fun checkpointOnlyDrain(native:Boolean, interleave:Boolean=false) {
         val f=tmp();val h=strand(f,0,6,8)
         assertTrue(realSink(f).projectOwnership(sid,"p",true))
         val q=EncryptedEventStore(File(f,if(native) com.tracescout.mobile.queue.QueueKeyStores.SDK_QUEUE else com.tracescout.mobile.queue.QueueKeyStores.RN_QUEUE),k,
@@ -235,7 +277,7 @@ class Pr3PipelineRegressionTest {
         QueueHome.of(q.backingFile()){q}
         val transport:Any=if(native) com.tracescout.mobile.TraceScoutMobile else com.tracescout.mobile.rn.RnTransport
         fun field(name:String)=transport.javaClass.getDeclaredField(name).apply{isAccessible=true}
-        val fields=(if(native) listOf("store","config","home","uploader","appContext","identity","lastPipelineDisposition")
+        val fields=(if(native) listOf("store","config","home","uploader","appContext","identity")
             else listOf("store","finalizedSession","lastPipelineDisposition")).associateWith{field(it)}
         val priorHook=com.tracescout.mobile.queue.RecoveryWorker.drainHook
         val prior=fields.mapValues{it.value.get(transport)}
@@ -272,8 +314,29 @@ class Pr3PipelineRegressionTest {
                 fields.getValue("appContext").set(transport,context)
                 fields.getValue("identity").set(transport,null)
                 transport.javaClass.getDeclaredMethod("installWorkerDrain").apply{isAccessible=true}.invoke(transport)
-                assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,
-                    com.tracescout.mobile.queue.RecoveryWorker.drainHook!!(context))
+                if (!interleave) {
+                    assertEquals(com.tracescout.mobile.queue.RecoveryWorker.Outcome.RETRY,
+                        com.tracescout.mobile.queue.RecoveryWorker.drainHook!!(context))
+                } else {
+                    val call=transport.javaClass.getDeclaredMethod("uploadRawWithOutcome",List::class.java,kotlin.jvm.functions.Function1::class.java).apply{isAccessible=true}
+                    var first:DurableUploadPipeline.Disposition?=null
+                    val error=java.util.concurrent.atomic.AtomicReference<Throwable>()
+                    val capture:(DurableUploadPipeline.Disposition)->Unit={ value ->
+                        first=value
+                        if(value==DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED) {
+                            val cfg=fields.getValue("config").get(transport)
+                            fields.getValue("config").set(transport,null)
+                            val second=Thread {try {
+                                val other:(DurableUploadPipeline.Disposition)->Unit={assertEquals(DurableUploadPipeline.Disposition.RETRYABLE_REMAINING,it)}
+                                assertEquals(false,call.invoke(transport,emptyList<ByteArray>(),other))
+                            } catch(t:Throwable){error.set(t)}}
+                            try {second.start();second.join(5000);assertFalse(second.isAlive)}
+                            finally {fields.getValue("config").set(transport,cfg)}
+                        }
+                    }
+                    assertEquals(true,call.invoke(transport,emptyList<ByteArray>(),capture))
+                    assertNull(error.get());assertEquals(DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED,first)
+                }
             } else {
                 fields.getValue("finalizedSession").set(transport,null)
                 val cfg=com.tracescout.mobile.rn.RnSecureConfig.Config("p","synthetic-test-key","test",url)
@@ -286,6 +349,23 @@ class Pr3PipelineRegressionTest {
             com.tracescout.mobile.queue.RecoveryCoordinator.release(context)
             com.tracescout.mobile.queue.RecoveryWorker.drainHook=priorHook
         }
+    }
+
+    @Test fun reconciledDeliveredQueueStillRetriesUnsettledCheckpoint() {
+        val f=tmp();val h=strand(f,0,0,0);val q=queue(f);q.append(owned(0))
+        val bodies=ArrayList<String>()
+        try {
+            pipelineWith(f,q,bodies,realSink(f),faults={if(it=="after_delivered_durable")throw DurableUploadPipeline.SimulatedProcessDeath(it)}){chunkOk(it)}
+                .upload(q.readAll().records,sid)
+            fail("death seam not reached")
+        } catch(_:DurableUploadPipeline.SimulatedProcessDeath) {}
+        assertEquals(1,q.readAll().records.size);assertNotNull(h.pendingCheckpoint())
+        bodies.clear()
+        val next=pipeline(f,q,bodies){Uploader.Result(ResponseAction.RETRY,503,"busy")}
+        next.upload(q.readAll().records,sid)
+        assertTrue(q.readAll().records.isEmpty());assertEquals(1,bodies.size);assertTrue(isCarrier(bodies.single()))
+        assertEquals(DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED,next.disposition)
+        assertNotNull(h.pendingCheckpoint())
     }
 
     @Test fun workerBootstrapsCheckpointOnlyWork() {
@@ -479,12 +559,19 @@ class Pr3PipelineRegressionTest {
     }
 
     @Test fun emptyQueueCheckpointFailuresKeepOnlyTransientRetriesOwed() {
-        for (mode in listOf("transport", "503", "429", "missingAck", "refused", "accepted")) {
+        for (mode in listOf("transport", "503", "429", "missingAck", "refused", "accepted", "settlementThrow")) {
             val f = tmp(); val h = strand(f, 0, 6, 6); val q = queue(f)
             assertTrue(realSink(f).projectOwnership(sid, "p", true))
             val frozen = snapshot(h.pendingCheckpoint())
             val bodies = ArrayList<String>()
-            val p = pipeline(f, q, bodies) {
+            val sink=object:AttributionSink by realSink(f) {
+                override fun settleLossCheckpoint(sessionId:String,protocol:String,lossAccountingVersion:Int,state:String,
+                    ackSessionId:String,acceptedThroughSequence:String?,acceptedCounts:Map<String,Long>,terminal:Boolean):AttributionSink.Settlement {
+                    if(mode=="settlementThrow")throw java.io.IOException("settlement failed")
+                    return realSink(f).settleLossCheckpoint(sessionId,protocol,lossAccountingVersion,state,ackSessionId,acceptedThroughSequence,acceptedCounts,terminal)
+                }
+            }
+            val p = pipelineWith(f, q, bodies, sink) {
                 when (mode) {
                     "transport" -> throw java.io.IOException("offline")
                     "503" -> Uploader.Result(ResponseAction.RETRY, 503, "temporary")

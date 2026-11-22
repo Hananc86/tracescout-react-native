@@ -1,5 +1,8 @@
 package com.tracescout.rn.react
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 import android.content.Context
 import android.os.Build
 import com.facebook.react.bridge.Promise
@@ -133,7 +136,7 @@ class TraceScoutRnModule(
             // applying the name to the session read earlier would resurrect a
             // session that no longer exists. A false return is the bridge's
             // `.noSession`, which is the honest answer for that race.
-            synchronized(identityLock) {
+            identityLock.withLock {
                 val current = session
                 if (current == null) {
                     false
@@ -248,7 +251,7 @@ class TraceScoutRnModule(
     @Volatile
     private var session: RnEnvelope.Identity? = null
 
-    private val identityLock = Any()
+    private val identityLock = ReentrantLock()
 
     /**
  * The one creator of a session on this platform, called exclusively by the
@@ -274,7 +277,7 @@ class TraceScoutRnModule(
             appVersion = packageVersionName(ctx),
             buildNumber = packageVersionCode(ctx),
             device = deviceFacts(ctx),
-        ).also { minted -> synchronized(identityLock) { session = minted } }
+        ).also { minted -> identityLock.withLock { session = minted } }
     }
 
     // ---------------------------------------------------------- JS surface
@@ -287,17 +290,26 @@ class TraceScoutRnModule(
     // place that named the methods gained it in a legible diff, and the one
     // place that carried only a number went stale with nothing to point at.
 
+    private val incidentContext by lazy {
+        object : com.tracescout.mobile.rn.RnIncidentCapture.Context2 {
+            override val identityLock get() = this@TraceScoutRnModule.identityLock
+            override fun identity() = session
+            override fun posture() = RnEnvelope.Posture(allowedViewCount = 0,
+                screenNeverRecord = bridge.currentRouteId() == null)
+            override fun screenId() = bridge.currentRouteId()
+        }
+    }
+
+    override fun invalidate() {
+        identityLock.withLock { session = null }
+        com.tracescout.mobile.rn.RnIncidentCapture.clearContext(incidentContext)
+        super.invalidate()
+    }
+
     @ReactMethod fun startSession(initialRouteId: String?, promise: Promise) {
         val result = bridge.startSession(initialRouteId)
         if (result.outcome == RnBridge.Outcome.RECORDED) {
-            com.tracescout.mobile.rn.RnIncidentCapture.install(reactContext.applicationContext,
-                object : com.tracescout.mobile.rn.RnIncidentCapture.Context2 {
-                    override val identityLock get() = this@TraceScoutRnModule.identityLock
-                    override fun identity() = session
-                    override fun posture() = RnEnvelope.Posture(allowedViewCount = 0,
-                        screenNeverRecord = bridge.currentRouteId() == null)
-                    override fun screenId() = bridge.currentRouteId()
-                })
+            com.tracescout.mobile.rn.RnIncidentCapture.install(reactContext.applicationContext, incidentContext)
         }
         promise.resolve(result.outcome.name)
     }

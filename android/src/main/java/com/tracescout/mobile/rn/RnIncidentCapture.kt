@@ -1,5 +1,8 @@
 package com.tracescout.mobile.rn
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 import android.content.Context
 import android.os.Looper
 import com.tracescout.mobile.capture.CrashHandler
@@ -71,6 +74,17 @@ object RnIncidentCapture {
 
     /** One install per process. A second would put the handler in its own chain. */
     private val installed = AtomicBoolean(false)
+    @Volatile private var currentContext: Context2? = null
+
+    @Synchronized internal fun bindContext(context: Context2): Boolean {
+        // Observers are process-wide; the React module providing identity is not.
+        currentContext = context
+        return installed.compareAndSet(false, true)
+    }
+
+    @Synchronized internal fun clearContext(context: Context2) {
+        if (currentContext === context) currentContext = null
+    }
 
     @Volatile private var detector: HangDetector? = null
 
@@ -103,8 +117,10 @@ object RnIncidentCapture {
  * server, which this client classifies TERMINAL and QUARANTINES — so an
  * invented identity would destroy the record it was trying to save.
  */
+    private val fallbackIdentityLock = ReentrantLock()
+
     interface Context2 {
-        val identityLock: Any get() = this
+        val identityLock: ReentrantLock get() = fallbackIdentityLock
         /** The live RN session, or null if none is running. */
         fun identity(): RnEnvelope.Identity?
 
@@ -135,7 +151,7 @@ object RnIncidentCapture {
         hangThresholdMs: Long = HangDetector.DEFAULT_THRESHOLD_MS,
         mainLooper: Looper = Looper.getMainLooper(),
     ): Boolean {
-        if (!installed.compareAndSet(false, true)) return false
+        if (!bindContext(ctx2)) return false
         val app = ctx.applicationContext
         installCrash(app, ctx2)
         installHang(app, ctx2, hangThresholdMs, mainLooper)
@@ -151,6 +167,7 @@ object RnIncidentCapture {
         crashTicketSequence.set(-1L)
         crashTicket = null
         installed.set(false)
+        currentContext = null
     }
 
     // ── crash ───────────────────────────────────────────────────────────────
@@ -183,7 +200,7 @@ object RnIncidentCapture {
                 }
             },
         ) { thread, throwable ->
-            buildCrashRecord(app, ctx2, thread, throwable)
+            buildCurrentCrashRecord(app, thread, throwable)
         }
         if (handler == null) {
             RecoveryTrace.log("rn_crash_install_refused", "why" to "handler_null")
@@ -218,71 +235,78 @@ object RnIncidentCapture {
  * authority does not own. Returning empty bytes instead would append a
  * record with sequence `-1`.
  */
+    private fun buildCurrentCrashRecord(app: Context, thread: Thread, throwable: Throwable): ByteArray =
+        buildCrashRecord(app, currentContext ?: throw IllegalStateException("rn_crash_no_context"), thread, throwable)
+
     private fun buildCrashRecord(
         app: Context,
         ctx2: Context2,
         thread: Thread,
         throwable: Throwable,
-    ): ByteArray = synchronized(ctx2.identityLock) {
-        val id = ctx2.identity()
-            ?: throw IllegalStateException("rn_crash_no_session")
-        // THE CLAIM IS THE TRANSPORT'S, AND A MODULE-BOUNDARY GUARD IS WHY.
-        // `ModuleBoundaryTest.B9` enumerates every `beginAdmission(` call site;
-        // claiming here made this file a third one and the guard caught it. The
-        // repair was not to re-point the enumeration but to put the claim where
-        // its SETTLEMENT already lived — `RnTransport` — because they are one
-        // fact and were split across two files. This producer asks for a ticket
-        // and never reaches the authority itself.
-        val raw = throwable.stackTrace
-        val plan = IncidentPolicy.framePlan(raw.size)
-        if (plan.dropped > 0) {
-            // The wire has no field for a within-event truncation (see
-            // `RnEnvelope.crash`), so the drop is disclosed HERE — the
-            // established local channel for a fact with no wire field.
-            RecoveryTrace.log(
-                "rn_crash_frames_truncated",
-                "captured" to raw.size, "emitted" to plan.emitted, "dropped" to plan.dropped,
-            )
-        }
-        val frames = ArrayList<RnEnvelope.IncidentFrame>(plan.emitted)
-        for (i in 0 until plan.emitted) {
-            val e = raw[i]
-            frames.add(
-                RnEnvelope.IncidentFrame(
-                    index = i,
-                    module = IncidentPolicy.boundModule(e.className),
-                    symbol = IncidentPolicy.boundSymbol(
-                        "${e.className}.${e.methodName}(${e.fileName}:${e.lineNumber})",
+    ): ByteArray {
+        val gate = ctx2.identityLock
+        if (!gate.tryLock()) throw IllegalStateException("rn_crash_identity_busy")
+        try {
+            val id = ctx2.identity()
+                ?: throw IllegalStateException("rn_crash_no_session")
+            // THE CLAIM IS THE TRANSPORT'S, AND A MODULE-BOUNDARY GUARD IS WHY.
+            // `ModuleBoundaryTest.B9` enumerates every `beginAdmission(` call site;
+            // claiming here made this file a third one and the guard caught it. The
+            // repair was not to re-point the enumeration but to put the claim where
+            // its SETTLEMENT already lived — `RnTransport` — because they are one
+            // fact and were split across two files. This producer asks for a ticket
+            // and never reaches the authority itself.
+            val raw = throwable.stackTrace
+            val plan = IncidentPolicy.framePlan(raw.size)
+            if (plan.dropped > 0) {
+                // The wire has no field for a within-event truncation (see
+                // `RnEnvelope.crash`), so the drop is disclosed HERE — the
+                // established local channel for a fact with no wire field.
+                RecoveryTrace.log(
+                    "rn_crash_frames_truncated",
+                    "captured" to raw.size, "emitted" to plan.emitted, "dropped" to plan.dropped,
+                )
+            }
+            val frames = ArrayList<RnEnvelope.IncidentFrame>(plan.emitted)
+            for (i in 0 until plan.emitted) {
+                val e = raw[i]
+                frames.add(
+                    RnEnvelope.IncidentFrame(
+                        index = i,
+                        module = IncidentPolicy.boundModule(e.className),
+                        symbol = IncidentPolicy.boundSymbol(
+                            "${e.className}.${e.methodName}(${e.fileName}:${e.lineNumber})",
+                        ),
                     ),
-                ),
-            )
-        }
-        val eventId = newEventId()
-        val eventPosture = ctx2.posture()
-        val eventScreen = ctx2.screenId()
-        val ticket = RnTransport.beginIncidentAdmission(app, id.sessionId, "mobile_crash")
-            ?: throw IllegalStateException("rn_crash_admission_unavailable")
-        crashTicket = ticket
-        crashTicketSequence.set(ticket.sequence)
-        return RnEnvelope.crash(
-            id = id,
-            eventId = eventId,
-            sequence = ticket.sequence,
-            timestampMillis = System.currentTimeMillis(),
-            monotonicNanos = System.nanoTime(),
-            posture = eventPosture,
-            // The event's own id IS the incident identity, as on the native
-            // producer: one crash, one record, one `UNIQUE (session_row_id,
-            // error_id)` row, and a retried upload upserts rather than
-            // duplicating. Bounded by construction — see `newEventId`.
-            errorId = eventId,
-            crashClass = IncidentPolicy.androidCrashClass(throwable.javaClass.name),
-            exceptionType = throwable.javaClass.name,
-            threadName = thread.name,
-            isMainThread = thread === Looper.getMainLooper().thread,
-            frames = frames,
-            screenId = eventScreen,
-        ).toByteArray(Charsets.UTF_8)
+                )
+            }
+            val eventId = newEventId()
+            val eventPosture = ctx2.posture()
+            val eventScreen = ctx2.screenId()
+            val ticket = RnTransport.beginIncidentAdmission(app, id.sessionId, "mobile_crash")
+                ?: throw IllegalStateException("rn_crash_admission_unavailable")
+            crashTicket = ticket
+            crashTicketSequence.set(ticket.sequence)
+            return RnEnvelope.crash(
+                id = id,
+                eventId = eventId,
+                sequence = ticket.sequence,
+                timestampMillis = System.currentTimeMillis(),
+                monotonicNanos = System.nanoTime(),
+                posture = eventPosture,
+                // The event's own id IS the incident identity, as on the native
+                // producer: one crash, one record, one `UNIQUE (session_row_id,
+                // error_id)` row, and a retried upload upserts rather than
+                // duplicating. Bounded by construction — see `newEventId`.
+                errorId = eventId,
+                crashClass = IncidentPolicy.androidCrashClass(throwable.javaClass.name),
+                exceptionType = throwable.javaClass.name,
+                threadName = thread.name,
+                isMainThread = thread === Looper.getMainLooper().thread,
+                frames = frames,
+                screenId = eventScreen,
+            ).toByteArray(Charsets.UTF_8)
+        } finally { gate.unlock() }
     }
 
     // ── hang ────────────────────────────────────────────────────────────────
@@ -295,7 +319,7 @@ object RnIncidentCapture {
     ) {
         val d = try {
             HangDetector(thresholdMillis = thresholdMs, mainLooper = mainLooper) { blockedMs, stack ->
-                onHang(app, ctx2, blockedMs, stack, thresholdMs)
+                currentContext?.let { live -> onHang(app, live, blockedMs, stack, thresholdMs) }
             }
         } catch (t: IllegalArgumentException) {
             // The detector refuses a threshold below its own floor rather than
@@ -323,7 +347,7 @@ object RnIncidentCapture {
         blockedMs: Long,
         stack: Array<StackTraceElement>,
         thresholdMs: Long,
-    ): Unit = synchronized(ctx2.identityLock) {
+    ): Unit = ctx2.identityLock.withLock {
         // The policy decides whether this is emittable at all — a non-finite or
         // non-positive duration is refused there, because the server reads
         // `blockedMs` with no range and a hang lane that can show a negative

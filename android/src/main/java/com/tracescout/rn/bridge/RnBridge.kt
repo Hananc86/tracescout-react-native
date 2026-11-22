@@ -1,5 +1,8 @@
 package com.tracescout.rn.bridge
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 import com.tracescout.rn.RnEnvelope
 import java.util.concurrent.ConcurrentHashMap
 
@@ -152,7 +155,7 @@ class RnBridge(
  * ([Outcome.NOT_INTEGRATED]) instead of quietly doing nothing.
  */
     private val applyUserId: ((String) -> Boolean)? = null,
-    private val identityAdmissionLock: Any = Any(),
+    private val identityAdmissionLock: ReentrantLock = ReentrantLock(),
 ) {
 
     /** An already-redacted, encoded frame the native layer produced. */
@@ -412,7 +415,7 @@ class RnBridge(
             return Outcome.INVALID_INPUT
         }
         val applied = try {
-            synchronized(identityAdmissionLock) { apply(accepted) }
+            identityAdmissionLock.withLock { apply(accepted) }
         } catch (_: Throwable) {
             // The owner is documented never to throw; if it does, the host app
             // still must not. A failure to apply is never a silent RECORDED.
@@ -1098,7 +1101,7 @@ class RnBridge(
  * the size budget is DROPPED with the snapshot kept — a partial tree that
  * lies about its own count is worse than an honest metadata event.
  */
-    private fun emitHierarchy(routeId: String, capture: HierarchyCapture, snap: Result): Result {
+    private fun emitHierarchy(routeId: String, capture: HierarchyCapture, snap: Result): Result = identityAdmissionLock.withLock {
         val id = identity() ?: return snap
         val wall = clock.wallMillis()
         val mono = clock.monotonicNanos()
@@ -1274,10 +1277,10 @@ class RnBridge(
     fun observedScreenHoldsWebContent(routeId: String): Boolean? = screenWebContent[routeId]
 
     private fun enqueueCurrent(expected: RnEnvelope.Identity, build: (RnEnvelope.Identity, Long) -> ByteArray): Long =
-        synchronized(identityAdmissionLock) {
-            val current = identity() ?: return@synchronized -1L
+        identityAdmissionLock.withLock {
+            val current = identity() ?: return@withLock -1L
             if (current.sessionId != expected.sessionId || current.projectId != expected.projectId)
-                return@synchronized -1L
+                return@withLock -1L
             sink.enqueue { sequence -> build(current, sequence) }
         }
 

@@ -1042,7 +1042,7 @@ object RnTransport {
  */
     private fun authorityFor(app: Context, sid: String, s: EncryptedEventStore): LossAuthority.Handle? {
         if (sid.isEmpty()) return null
-        LossAuthority.peek(app.filesDir, sid)?.let { return it }
+        LossAuthority.peek(app.filesDir, sid)?.let { if (it.reconciledWithQueue) return it }
         val rr = s.readAll()
         return when (val o = LossAuthority.open(app.filesDir, sid, LossAuthority.QueueSnapshot(rr.records, rr.isTrustworthy))) {
             is LossAuthority.Open.Ok -> o.handle

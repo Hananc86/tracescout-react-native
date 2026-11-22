@@ -990,6 +990,50 @@ class DurableUploadPipeline(
         }
     }
 
+    private fun recoverEmpty(fallbackSessionId: String) {
+        RecoveryTrace.log("upload_empty_noop"); results.last = null
+        disposition = Disposition.EMPTY
+        // F7 R-2 — THE ONE PRODUCTION TRIGGER, and it
+        // is HERE because this is the one branch that has established, from
+        // the drain's own image, that no chunk exists to carry a disclosure.
+        // Below this line a chunk is going out and F6 rides it; above it,
+        // there is nothing and a finalized session would otherwise never be
+        // told. The gate inside decides WHETHER to speak.
+        //
+        // THE DRAIN'S OWN SESSION IS NOT THE ONLY CANDIDATE, AND AT
+        // PROCESS START IT IS THE ONE THAT CANNOT ANSWER YES. `start`
+        // mints the new identity BEFORE it calls `recoverInherited`, whose
+        // empty-queue path drains with that identity as the fallback owner
+        // so this gate used to be asked whether a session born a
+        // millisecond ago had been declared over. Only the host's explicit
+        // session-end seam writes that claim, so the answer was
+        // structurally `false`, and the cross-launch case
+        // `endSessionAuthoritatively`'s KDoc promises ("a host that
+        // declares session end and is then killed emits the checkpoint on
+        // the next launch") could never fire here. The PREVIOUS session is
+        // named by the durable record itself, never by a pointer this
+        // process happens to hold — a process that died holds nothing.
+        for (s in chunklessFinalityCandidates(fallbackSessionId)) {
+            val retry = attribution.f7PendingCheckpointRetry(s)
+            val outcome = if (retry != null) postCarrierDocument(s, retry,
+                "f7_metadata_only_request", "f7_metadata_only_retry",
+                "f7_metadata_only_transport_failed", "f7_metadata_only_unacknowledged")
+            else finalizeChunklessSession(s)
+            // The record queue is empty, but a transient carrier failure
+            // still owes the worker a retry. Never overwrite an earlier
+            // candidate's obligation with a later successful/refused one.
+            val retryOwed = when (outcome) {
+                is MetadataOnly.NotSent -> outcome.code !in setOf(
+                    "carrier_project_unproven", "carrier_project_mismatch", "carrier_declined")
+                is MetadataOnly.Unacknowledged -> outcome.action != ResponseAction.TERMINAL
+                is MetadataOnly.Acknowledged -> outcome.settlement == null || outcome.settlement is AttributionSink.Settlement.NotDurable ||
+                    outcome.settlement is AttributionSink.Settlement.Refused
+                is MetadataOnly.NotEmitted -> false
+            }
+            if (retryOwed) disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
+        }
+    }
+
     private fun uploadInner(records: List<ByteArray>, fallbackSessionId: String) {
         // F-15 — a fresh per-drain carrier budget. See [f15DrainAttempts]. The
         // per-SESSION burst counter is deliberately NOT reset here: that one
@@ -998,50 +1042,7 @@ class DurableUploadPipeline(
         // An empty queue must not produce a request at all. A round trip that
         // could only ever be answered "nothing happened" is an invitation to
         // read a 2xx as progress.
-        if (records.isEmpty()) {
-            RecoveryTrace.log("upload_empty_noop"); results.last = null
-            disposition = Disposition.EMPTY
-            // F7 R-2 — THE ONE PRODUCTION TRIGGER, and it
-            // is HERE because this is the one branch that has established, from
-            // the drain's own image, that no chunk exists to carry a disclosure.
-            // Below this line a chunk is going out and F6 rides it; above it,
-            // there is nothing and a finalized session would otherwise never be
-            // told. The gate inside decides WHETHER to speak.
-            //
-            // THE DRAIN'S OWN SESSION IS NOT THE ONLY CANDIDATE, AND AT
-            // PROCESS START IT IS THE ONE THAT CANNOT ANSWER YES. `start`
-            // mints the new identity BEFORE it calls `recoverInherited`, whose
-            // empty-queue path drains with that identity as the fallback owner
-            // so this gate used to be asked whether a session born a
-            // millisecond ago had been declared over. Only the host's explicit
-            // session-end seam writes that claim, so the answer was
-            // structurally `false`, and the cross-launch case
-            // `endSessionAuthoritatively`'s KDoc promises ("a host that
-            // declares session end and is then killed emits the checkpoint on
-            // the next launch") could never fire here. The PREVIOUS session is
-            // named by the durable record itself, never by a pointer this
-            // process happens to hold — a process that died holds nothing.
-            for (s in chunklessFinalityCandidates(fallbackSessionId)) {
-                val retry = attribution.f7PendingCheckpointRetry(s)
-                val outcome = if (retry != null) postCarrierDocument(s, retry,
-                    "f7_metadata_only_request", "f7_metadata_only_retry",
-                    "f7_metadata_only_transport_failed", "f7_metadata_only_unacknowledged")
-                else finalizeChunklessSession(s)
-                // The record queue is empty, but a transient carrier failure
-                // still owes the worker a retry. Never overwrite an earlier
-                // candidate's obligation with a later successful/refused one.
-                val retryOwed = when (outcome) {
-                    is MetadataOnly.NotSent -> outcome.code !in setOf(
-                        "carrier_project_unproven", "carrier_project_mismatch", "carrier_declined")
-                    is MetadataOnly.Unacknowledged -> outcome.action != ResponseAction.TERMINAL
-                    is MetadataOnly.Acknowledged -> outcome.settlement is AttributionSink.Settlement.NotDurable ||
-                        outcome.settlement is AttributionSink.Settlement.Refused
-                    is MetadataOnly.NotEmitted -> false
-                }
-                if (retryOwed) disposition = Disposition.F15_CHECKPOINT_RETRY_OWED
-            }
-            return
-        }
+        if (records.isEmpty()) { recoverEmpty(fallbackSessionId); return }
 
         // A batch is addressed by the session its RECORDS carry — never by
         // whichever session happens to be running. Recovery uploads a PREVIOUS
@@ -1103,8 +1104,9 @@ class DurableUploadPipeline(
             }
         }
         if (rest.isEmpty()) {
-            RecoveryTrace.log("upload_empty_after_reconcile"); results.last = null
-            disposition = Disposition.EMPTY; return
+            RecoveryTrace.log("upload_empty_after_reconcile")
+            recoverEmpty(fallbackSessionId)
+            return
         }
         // E-5 — THE SIXTH SAME-IMAGE ATTEMPT REFUSES BEFORE ANY REQUEST IS
         // BUILT. The epoch is the logical fingerprint of the image this drain
@@ -1204,7 +1206,7 @@ class DurableUploadPipeline(
         // the whole chunk and the crash inside it. Refusing here RETAINS the
         // records instead of destroying them; nothing is posted, dequeued,
         // parked, quarantined or removed, and the claim is left exactly as it is.
-        if (resume == null && !sessionAlreadyTerminal(
+        if (resume == null && sliceProjectRefusal(sessionOwnedPrefix(rest, fallbackSessionId).second) == null && !sessionAlreadyTerminal(
                 rest.firstOrNull()?.let { LossAuthority.RecordFields.parse(it)?.sessionId } ?: fallbackSessionId)) {
             val g = reconcileStrandedPendingCheckpoint(rest)
             if (g is F15Gate.Unresolved) {
