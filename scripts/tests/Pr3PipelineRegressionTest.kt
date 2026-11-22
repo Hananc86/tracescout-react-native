@@ -178,6 +178,7 @@ class Pr3PipelineRegressionTest {
         quar: Quar = Quar(),
         mono: Mono = Mono(),
         faults: (String) -> Unit = {},
+        inflightStore: InFlightStore = InFlightStore.file(File(f, "inflight.txt")),
         respond: (String) -> Uploader.Result,
     ): DurableUploadPipeline = DurableUploadPipeline(
         home = QueueHome.of(q.backingFile()) { q },
@@ -187,7 +188,7 @@ class Pr3PipelineRegressionTest {
         },
         projectId = "p", maxRetries = 1, appContext = null, backoffMillis = { 0L },
         results = Sink(), quarantine = quar, sleeper = {},
-        inflight = InFlightStore.file(File(f, "inflight.txt")),
+        inflight = inflightStore,
         attribution = sink,
         park = park,
         monotonicNanos = mono,
@@ -215,6 +216,19 @@ class Pr3PipelineRegressionTest {
         assertFalse(bodies.single().contains("foreign"));assertTrue(q.readAll().records.isEmpty())
         assertEquals("slice_project_mismatch",entries.single().refusalCode)
         assertEquals("parking must not rewrite a frozen claim",frozen,snapshot(h.pendingCheckpoint()))
+    }
+
+    @Test fun descriptorSaveFailureCannotBecomeAnEmptyDrain() {
+        val f=tmp();val q=queue(f);q.append(owned(0));val bodies=ArrayList<String>()
+        val refused=object:InFlightStore {
+            override fun load():InFlightBatch?=null
+            override fun save(batch:InFlightBatch)=false
+            override fun clear(){}
+        }
+        val p=pipelineWith(f,q,bodies,realSink(f),inflightStore=refused){error("unfrozen batch posted")}
+        p.upload(q.readAll().records,sid)
+        assertEquals(1,q.readAll().records.size);assertTrue(bodies.isEmpty())
+        assertEquals("queued records must retain their retry",DurableUploadPipeline.Disposition.RETRYABLE_REMAINING,p.disposition)
     }
 
     @Test fun successfulFinalChunkWithoutLossAckRetainsCarrierRetry() {
@@ -603,11 +617,13 @@ class Pr3PipelineRegressionTest {
             assertEquals("frozen attachment choice must survive upgrade",oldBody,bodies.last())
             assertEquals(2,bodies.size);assertEquals(5,q.readAll().records.size)
             assertTrue(store.save(store.load()!!.copy(contentSha256="f".repeat(64))))
-            pipeline(f,q,bodies){body ->
-                assertTrue("corrupt descriptor must never reach event delivery",isCarrier(body))
-                Uploader.Result(ResponseAction.RETRY,503,"temporary")
-            }.upload(q.readAll().records,sid)
-            assertEquals(3,bodies.size);assertTrue(isCarrier(bodies.last()))
+            val refused = pipeline(f,q,bodies){error("corrupt descriptor must not post")}
+            refused.upload(q.readAll().records,sid)
+            // A descriptor refusal with five retained records is not an empty
+            // drain. The old third carrier came from that incorrect fallback.
+            assertEquals(2,bodies.size)
+            assertEquals(DurableUploadPipeline.Disposition.RETRYABLE_REMAINING,refused.disposition)
+            assertEquals(5,q.readAll().records.size)
             assertEquals(15L,authority(f).pendingCheckpoint()!!.throughSequence)
         }
     }

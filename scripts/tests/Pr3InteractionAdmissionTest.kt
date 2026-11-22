@@ -13,6 +13,36 @@ import com.tracescout.mobile.queue.DurableReplace
 import javax.crypto.KeyGenerator
 
 class Pr3InteractionAdmissionTest {
+    @Test fun frameMetadataCompletionReflectsGovernedAppendDurability() {
+        fun field(n:String)=TraceScoutMobile::class.java.getDeclaredField(n).apply{isAccessible=true}
+        val names=listOf("config","bracket","authority")
+        val fields=names.associateWith{field(it)};val prior=fields.mapValues{it.value.get(TraceScoutMobile)}
+        val key=KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val enqueue=TraceScoutMobile::class.java.getDeclaredMethod("enqueue",Envelope.Record::class.java,kotlin.jvm.functions.Function1::class.java).apply{isAccessible=true}
+        try {
+            for(mode in listOf("committed","refused","indeterminate")) {
+                val dir=java.nio.file.Files.createTempDirectory("pr3-metadata-$mode").toFile()
+                try {
+                    val queue=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,"queue.bin"),key,if(mode=="refused")1 else 1024*1024,
+                        com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,DurableReplace.DirSync{mode!="indeterminate"})
+                    val home=com.tracescout.mobile.queue.QueueHome.of(queue.backingFile()){queue}
+                    fields.getValue("config").set(TraceScoutMobile,TraceScoutMobile.Config("p","synthetic-test-key"))
+                    fields.getValue("bracket").set(TraceScoutMobile,com.tracescout.mobile.internal.queue.EvictionBracket(home))
+                    fields.getValue("authority").set(TraceScoutMobile,null)
+                    // A missing owner is disclosed by the real enqueue; this fixture
+                    // isolates the governed store's three durability answers.
+                    val record=Envelope.Record("frame-$mode","mobile_visual_frame",0,1,"{}".toByteArray())
+                    val completed=CountDownLatch(1);val outcome=AtomicReference<Boolean>()
+                    val callback:(Boolean)->Unit={outcome.set(it);completed.countDown()}
+                    assertEquals(true,enqueue.invoke(TraceScoutMobile,record,callback))
+                    assertTrue(completed.await(5,TimeUnit.SECONDS))
+                    assertEquals(mode=="committed",outcome.get())
+                    assertEquals(if(mode=="refused")0 else 1,queue.readAll().records.size)
+                } finally {dir.deleteRecursively()}
+            }
+        } finally {TraceScoutMobile.awaitFrameUpload();fields.forEach{(n,f)->f.set(TraceScoutMobile,prior[n])}}
+    }
+
     @Test fun belowSlopSamplesCannotRelaxGesturePrivacy() {
         val safe=com.tracescout.mobile.capture.interaction.GestureLifecycle.SampleFacts("screen",false,false,true,
             com.tracescout.mobile.capture.interaction.InteractionPolicy.TargetClass.SAFE,

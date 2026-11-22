@@ -326,7 +326,11 @@ object RnTransport {
  *
  * Returns the assigned sequence, or -1 when the record was refused.
  */
-    fun enqueue(ctx: Context, build: (Long) -> ByteArray): Long {
+    fun enqueue(ctx: Context, build: (Long) -> ByteArray): Long = enqueueRecord(ctx, false, build)
+
+    fun enqueueOpener(ctx: Context, build: (Long) -> ByteArray): Long = enqueueRecord(ctx, true, build)
+
+    private fun enqueueRecord(ctx: Context, requireCommitted: Boolean, build: (Long) -> ByteArray): Long {
         val app = ctx.applicationContext
         val s = store ?: openStore(app).also { store = it }
         return try {
@@ -387,6 +391,8 @@ object RnTransport {
                 // which both producers reach through this call.
                 val r = bracketFor(app).append(bytes)
                 if (!r.stored) refusal = r.reason ?: "unknown"
+                else if (requireCommitted && r.durability != EncryptedEventStore.Durability.COMMITTED)
+                    refusal = "opener_not_committed"
                 // F2 settlement, inside the same critical section as the
                 // append: ADMITTED on a COMMITTED append; a refusal is ONE loss
                 // in the admission's own family; an indeterminate append

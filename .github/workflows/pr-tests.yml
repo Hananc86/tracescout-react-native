@@ -49,6 +49,7 @@ jobs:
           python3 scripts/tests/pr3-privacy-probe.py
           python3 scripts/tests/pr3-privacy-probe.py --control
           python3 scripts/tests/pr3-privacy-probe.py --unscaled-control
+          python3 scripts/tests/pr3-privacy-probe.py --bounds-control
       - uses: actions/upload-artifact@v4
         if: always()
         with:

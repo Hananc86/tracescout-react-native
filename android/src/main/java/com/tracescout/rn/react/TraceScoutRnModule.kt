@@ -49,6 +49,8 @@ class TraceScoutRnModule(
     private val sink = object : RnBridge.DurableSink {
         override fun enqueue(build: (Long) -> ByteArray): Long =
             RnTransport.enqueue(reactContext.applicationContext, build)
+        override fun enqueueOpener(build: (Long) -> ByteArray): Long =
+            RnTransport.enqueueOpener(reactContext.applicationContext, build)
 
         // The bridge reports a moment; the transport decides what it means.
         // Forwarding it verbatim keeps this adapter free of any rule.
@@ -100,6 +102,7 @@ class TraceScoutRnModule(
     private fun buildBridge() = RnBridge(
         identity = { session },
         identityAdmissionLock = identityLock,
+        publishSession = { session = it },
         beginSession = { beginIdentity(reactContext.applicationContext) },
         configured = {
             com.tracescout.mobile.rn.RnSecureConfig
@@ -277,7 +280,7 @@ class TraceScoutRnModule(
             appVersion = packageVersionName(ctx),
             buildNumber = packageVersionCode(ctx),
             device = deviceFacts(ctx),
-        ).also { minted -> identityLock.withLock { session = minted } }
+        )
     }
 
     // ---------------------------------------------------------- JS surface

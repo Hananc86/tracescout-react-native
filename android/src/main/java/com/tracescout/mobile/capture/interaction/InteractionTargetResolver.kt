@@ -150,13 +150,37 @@ object InteractionTargetResolver {
     }
 
     private fun contains(v: View, x: Float, y: Float): Boolean {
-        // Android maps child/ancestor transforms and clipping into root bounds.
-        // Convert those bounds to the screen coordinates supplied by raw touch.
         val bounds = android.graphics.Rect()
         if (!v.getGlobalVisibleRect(bounds)) return false
-        val rootLocation = IntArray(2)
-        v.rootView.getLocationOnScreen(rootLocation)
-        return x >= bounds.left + rootLocation[0] && x < bounds.right + rootLocation[0] &&
-            y >= bounds.top + rootLocation[1] && y < bounds.bottom + rootLocation[1]
+        val root = v.rootView
+        val loc = IntArray(2)
+        root.getLocationOnScreen(loc)
+        if (x < bounds.left + loc[0] || x >= bounds.right + loc[0] ||
+            y < bounds.top + loc[1] || y >= bounds.bottom + loc[1]) return false
+        // Visible bounds are only an axis-aligned broad phase. Invert each
+        // transform before authorizing a point, including ancestor scrolling.
+        // A transformed root has no public screen-to-window inverse on API 26;
+        // uncertainty must take resolve's restrictive path.
+        check(root.matrix.isIdentity) { "unresolved root transform" }
+        val path = ArrayList<View>()
+        var node = v
+        while (node !== root) {
+            path.add(node)
+            node = node.parent as? View ?: error("unresolved view ancestry")
+        }
+        val point = floatArrayOf(x - loc[0], y - loc[1])
+        val inverse = android.graphics.Matrix()
+        for (child in path.asReversed()) {
+            val parent = child.parent as View
+            point[0] += parent.scrollX - child.left
+            point[1] += parent.scrollY - child.top
+            check(child.matrix.invert(inverse)) { "noninvertible view transform" }
+            inverse.mapPoints(point)
+            check(point.all { it.isFinite() }) { "invalid transformed point" }
+            // Conservative ancestor clipping: never grant through an unknown
+            // clipChildren/custom drawing arrangement.
+            if (point[0] < 0 || point[0] >= child.width || point[1] < 0 || point[1] >= child.height) return false
+        }
+        return point[0] >= 0 && point[0] < v.width && point[1] >= 0 && point[1] < v.height
     }
 }

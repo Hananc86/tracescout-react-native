@@ -14,6 +14,81 @@ import org.junit.Test
 import kotlin.concurrent.withLock
 
 class Pr3HostBoundaryTest {
+    @Test fun indeterminateOpenerCannotPublishThroughRealTransport() {
+        val dir=java.nio.file.Files.createTempDirectory("pr3-opener").toFile()
+        val context=object:ContextWrapper(null) {
+            override fun getFilesDir()=dir
+            override fun getApplicationContext():Context=this
+        }
+        val key=javax.crypto.KeyGenerator.getInstance("AES").apply{init(256)}.generateKey()
+        val sid="ts_1700000000000_dddddddddddd"
+        fun field(n:String)=RnTransport::class.java.getDeclaredField(n).apply{isAccessible=true}
+        val fields=listOf("store","bracket").associateWith{field(it)};val prior=fields.mapValues{it.value.get(RnTransport)}
+        val deadline=field("deadlineArmed").get(RnTransport) as java.util.concurrent.atomic.AtomicBoolean
+        val priorDeadline=deadline.getAndSet(true)
+        val count=field("pendingSinceDrain").get(RnTransport) as java.util.concurrent.atomic.AtomicLong
+        val bytes=field("pendingBytes").get(RnTransport) as java.util.concurrent.atomic.AtomicLong
+        val priorCount=count.getAndSet(0);val priorBytes=bytes.getAndSet(0)
+        try {
+            com.tracescout.mobile.internal.loss.LossAuthority.closeAll()
+            val q=com.tracescout.mobile.queue.EncryptedEventStore(java.io.File(dir,com.tracescout.mobile.queue.QueueKeyStores.RN_QUEUE),key,1024*1024,
+                com.tracescout.mobile.queue.EncryptedEventStore.EvictionPolicy.ACTIVE_QUEUE,com.tracescout.mobile.queue.DurableReplace.DirSync{false})
+            val home=com.tracescout.mobile.queue.QueueHome.of(q.backingFile()){q}
+            val h=com.tracescout.mobile.internal.loss.LossAuthority.open(dir,sid,
+                com.tracescout.mobile.internal.loss.LossAuthority.QueueSnapshot(emptyList(),true),{key},com.tracescout.mobile.queue.DurableReplace.DirSync{true})
+            assertTrue(h is com.tracescout.mobile.internal.loss.LossAuthority.Open.Ok)
+            fields.getValue("store").set(RnTransport,q)
+            fields.getValue("bracket").set(RnTransport,com.tracescout.mobile.internal.queue.EvictionBracket(home))
+            val result=RnTransport.enqueueOpener(context){seq->
+                RnEnvelope.envelope(RnEnvelope.Identity("p",sid,"a","test","host.app"),"evt_opener","mobile_session_start",seq,1,1,RnEnvelope.Posture(allowedViewCount=0,screenNeverRecord=false)).toByteArray()
+            }
+            assertEquals("stored but unsynced opener must be refused",-1L,result)
+            assertEquals("fixture must reach actual indeterminate append",1,q.readAll().records.size)
+            val owner=(h as com.tracescout.mobile.internal.loss.LossAuthority.Open.Ok).handle
+            assertEquals("indeterminate claim must remain unsettled",1,owner.unsettledSequences().size)
+        } finally {deadline.set(priorDeadline);count.set(priorCount);bytes.set(priorBytes);fields.forEach{(n,f)->f.set(RnTransport,prior[n])};com.tracescout.mobile.internal.loss.LossAuthority.closeAll();dir.deleteRecursively()}
+    }
+
+    @Test fun sessionPublicationWaitsForCommittedOpener() {
+        for (accepted in listOf(false,true)) {
+            val live=java.util.concurrent.atomic.AtomicReference<RnEnvelope.Identity?>(null)
+            val candidate=RnEnvelope.Identity("p","candidate","a","test","host.app")
+            val lock=java.util.concurrent.locks.ReentrantLock()
+            val entered=java.util.concurrent.CountDownLatch(1);val resume=java.util.concurrent.CountDownLatch(1)
+            val error=java.util.concurrent.atomic.AtomicReference<Throwable>()
+            val result=java.util.concurrent.atomic.AtomicReference<com.tracescout.rn.bridge.RnBridge.Result>()
+            val rows=java.util.concurrent.CopyOnWriteArrayList<String>()
+            val bridge=com.tracescout.rn.bridge.RnBridge(identity={live.get()},beginSession={candidate},configured={true},
+                identityAdmissionLock=lock,publishSession={live.set(it)},
+                sink=object:com.tracescout.rn.bridge.RnBridge.DurableSink {
+                    override fun flushHint(reason:String){};override fun stateName()="READY"
+                    override fun finalizeSession(sessionId:String)="RECORDED"
+                    override fun enqueue(build:(Long)->ByteArray):Long {rows.add(String(build(1)));return 1}
+                    override fun enqueueOpener(build:(Long)->ByteArray):Long {
+                        assertNull("candidate published before durable opener",live.get())
+                        assertTrue("opener must hold observer identity lock",lock.isHeldByCurrentThread)
+                        entered.countDown();check(resume.await(5,java.util.concurrent.TimeUnit.SECONDS))
+                        if(!accepted)return -1
+                        rows.add(String(build(0)));return 0
+                    }
+                },clock=object:com.tracescout.rn.bridge.RnBridge.NativeClock {
+                    override fun wallMillis()=1L;override fun monotonicNanos()=1L
+                },ids=object:com.tracescout.rn.bridge.RnBridge.EventIdSource{override fun newEventId()="evt_opener_test"})
+            val thread=Thread{try{result.set(bridge.startSession("home"))}catch(t:Throwable){error.set(t)}}
+            try {
+                thread.start();assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS))
+                assertNull(live.get());assertFalse("crash observer must refuse during opener",lock.tryLock())
+                resume.countDown();thread.join(5000);assertFalse(thread.isAlive);assertNull(error.get())
+                assertEquals(if(accepted)com.tracescout.rn.bridge.RnBridge.Outcome.RECORDED else com.tracescout.rn.bridge.RnBridge.Outcome.REFUSED,result.get().outcome)
+                assertEquals(if(accepted)candidate else null,live.get())
+                val next=bridge.lifecycle("foreground")
+                assertEquals(if(accepted)com.tracescout.rn.bridge.RnBridge.Outcome.RECORDED else com.tracescout.rn.bridge.RnBridge.Outcome.NO_SESSION,next.outcome)
+                assertEquals(if(accepted)2 else 0,rows.size)
+                if(accepted)assertEquals("mobile_session_start",org.json.JSONObject(rows.first()).getString("eventType"))
+            } finally {resume.countDown();thread.join(5000)}
+        }
+    }
+
     @Test fun bridgeRefreshesIdentityAtSequenceAdmissionAndRejectsReplacedSession() {
         val old=RnEnvelope.Identity("p","s","a","test","host.app",userId="old")
         for (replaceSession in listOf(false,true)) {

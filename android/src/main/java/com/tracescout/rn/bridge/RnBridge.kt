@@ -46,9 +46,9 @@ class RnBridge(
  */
     private val identity: () -> RnEnvelope.Identity?,
     /**
- * The ONE creator. Only [startSession] calls it — the opener event and
- * session creation are a single act, so a session without an opener is
- * unrepresentable rather than merely discouraged.
+ * The candidate creator. Only [startSession] calls it; production must not
+ * expose the candidate through [identity] until [publishSession] runs after
+ * the durable opener.
  */
     private val beginSession: () -> RnEnvelope.Identity?,
     /** Whether a persisted configuration exists — types the refusal. */
@@ -156,6 +156,8 @@ class RnBridge(
  */
     private val applyUserId: ((String) -> Boolean)? = null,
     private val identityAdmissionLock: ReentrantLock = ReentrantLock(),
+    /** Publish a candidate only after its opener is committed, under the shared identity lock. */
+    private val publishSession: ((RnEnvelope.Identity) -> Unit)? = null,
 ) {
 
     /** An already-redacted, encoded frame the native layer produced. */
@@ -229,6 +231,8 @@ class RnBridge(
  * Returns the assigned sequence, or -1 when the record was refused.
  */
         fun enqueue(build: (Long) -> ByteArray): Long
+        /** Success requires a COMMITTED opener, never merely indeterminate storage. */
+        fun enqueueOpener(build: (Long) -> ByteArray): Long = enqueue(build)
 
         /**
  * Report a SEMANTIC MOMENT at which uploading would be appropriate.
@@ -479,29 +483,10 @@ class RnBridge(
     // ---------------------------------------------------------------- emission
 
     /** The first event of a session. Carries sequence 0 when the store is fresh. */
-    fun startSession(initialRouteId: String?): Result {
-        if (initialRouteId != null && !isSafeId(initialRouteId)) {
-            return Result(Outcome.INVALID_INPUT)
-        }
-        // The opener is the ONLY event allowed to create the session — one
-        // act, so a session without a `mobile_session_start` cannot exist.
+    fun startSession(initialRouteId: String?): Result = identityAdmissionLock.withLock {
+        if (initialRouteId != null && !isSafeId(initialRouteId)) return Result(Outcome.INVALID_INPUT)
         val id = beginSession() ?: return Result(Outcome.NOT_CONFIGURED)
-        lastFrameWallMs = -1; framesThisSession = 0
-        screenWebContent.keys.toList().forEach { screenWebContent.remove(it) }
-        if (initialRouteId != null) currentRoute = initialRouteId
-        // A new session invalidates hosts AND attempts from the previous one.
-        routeHosts?.sessionChanged(identity()?.sessionId)
-        routeHosts?.routeChanged(initialRouteId)
-        // DRAINED, NOT `.clear`. A repo guard forbids `.clear` anywhere in
-        // this file and it is RIGHT to: `store.clear` on the durable queue is
-        // the exact call that destroyed captured records, and a reviewer
-        // scanning for it must not have to decide which `clear` is which. This
-        // is a local queue of in-flight attempts, but the guard is a blunt
-        // instrument on purpose — so drain it explicitly instead of weakening
-        // the guard to admit a "safe" case.
-        while (pendingOutcomes.poll() != null) { /* discard */ }
-        attachDeadline?.cancel()
-        return emitWith(id, "mobile_session_start", neverRecord = false) {
+        val result = emitWith(id, "mobile_session_start", neverRecord = false, opener = true) {
             buildMap {
                 // Schema-REQUIRED fields (mobile_session_start.schema.json).
                 // metadata_only is honest for RN v1; "manual" because the
@@ -518,6 +503,24 @@ class RnBridge(
                 }
             }
         }
+        if (result.outcome != Outcome.RECORDED) return result
+        publishSession?.invoke(id)
+        lastFrameWallMs = -1; framesThisSession = 0
+        screenWebContent.keys.toList().forEach { screenWebContent.remove(it) }
+        currentRoute = initialRouteId
+        // A new session invalidates hosts AND attempts from the previous one.
+        routeHosts?.sessionChanged(id.sessionId)
+        routeHosts?.routeChanged(initialRouteId)
+        // DRAINED, NOT `.clear`. A repo guard forbids `.clear` anywhere in
+        // this file and it is RIGHT to: `store.clear` on the durable queue is
+        // the exact call that destroyed captured records, and a reviewer
+        // scanning for it must not have to decide which `clear` is which. This
+        // is a local queue of in-flight attempts, but the guard is a blunt
+        // instrument on purpose — so drain it explicitly instead of weakening
+        // the guard to admit a "safe" case.
+        while (pendingOutcomes.poll() != null) { /* discard */ }
+        attachDeadline?.cancel()
+        result
     }
 
     /**
@@ -1255,7 +1258,7 @@ class RnBridge(
     ): Result {
         val id = identity()
             ?: return Result(if (configured()) Outcome.NO_SESSION else Outcome.NOT_CONFIGURED)
-        return emitWith(id, eventType, neverRecord, webView, extra)
+        return emitWith(id, eventType, neverRecord, webView, extra = extra)
     }
 
     /**
@@ -1289,6 +1292,7 @@ class RnBridge(
         eventType: String,
         neverRecord: Boolean,
         webView: (() -> RnEnvelope.WebViewRef?)? = null,
+        opener: Boolean = false,
         extra: () -> Map<String, Any?>,
     ): Result {
         val body = extra()
@@ -1310,7 +1314,7 @@ class RnBridge(
         // session's carrier by default.
         val webViewRef = webView
         val wv = webViewRef?.invoke()
-        val seq = enqueueCurrent(id) { current, assigned ->
+        val build: (RnEnvelope.Identity, Long) -> ByteArray = { current, assigned ->
             RnEnvelope.envelope(
                 id = current,
                 eventId = eventId,
@@ -1329,6 +1333,7 @@ class RnBridge(
                 webView = wv,
             ).toByteArray(Charsets.UTF_8)
         }
+        val seq = if (opener) sink.enqueueOpener { build(id, it) } else enqueueCurrent(id, build)
         return if (seq < 0) Result(Outcome.REFUSED)
         else Result(Outcome.RECORDED, seq, neverRecord)
     }

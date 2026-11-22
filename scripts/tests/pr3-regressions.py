@@ -6,7 +6,7 @@ that retaining the old producer identity makes the interleaving test fail.
 """
 from pathlib import Path
 import argparse, subprocess, tempfile
-p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');p.add_argument('--mutate-frame',action='store_true');p.add_argument('--mutate-route',action='store_true');p.add_argument('--mutate-flush',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--compiler-lib',required=True);p.add_argument('--out',required=True);p.add_argument('--mutate-identity',action='store_true');p.add_argument('--mutate-frame',action='store_true');p.add_argument('--mutate-frame-commit',action='store_true');p.add_argument('--mutate-route',action='store_true');p.add_argument('--mutate-flush',action='store_true');a=p.parse_args()
 r=Path(__file__).resolve().parents[2];out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
 def read(n):return (r/'android/src/main/java/com/tracescout/mobile'/n).read_text()
 def block(s,start):
@@ -23,15 +23,17 @@ s=read('TraceScoutMobile.kt')
 start=s[s.index('beginTransportChange(TransportOwner.LIVE)'):s.index('endTransportChange()',s.index('beginTransportChange(TransportOwner.LIVE)'))]
 assert start.index('LossAuthority.open(')<start.index('val liveUploader = Uploader(')<start.index('config = cfg')<start.index('uploader = liveUploader')
 print('PASS source guard: throwing authority/reconciliation/uploader construction precedes config publication',flush=True)
-identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun').replace('noinline onSubmitted','onSubmitted')
+identity=block(s,'private inline fun enqueueDisclosing(').replace('private inline fun','fun').replace('noinline onSubmitted','onSubmitted').replace('noinline onCommitted','onCommitted')
 if a.mutate_identity:identity=identity.replace('build(live, d)','build(expected, d)')
 flush=block(s,'private fun uploadRaw(records:').replace('private fun','fun')
 if a.mutate_flush:flush=flush.replace('disposition == DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED','false')
 route=block(s,'private fun publishCaptureRoute(').replace('private fun','fun')
 if a.mutate_route:route=route.replace('if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized false','')
 frame=block(s,'if (frameAdmission != EnqueueAdmission.SUBMITTED)').replace('return@guard','return')
-assert s.index('val frameAdmission = enqueueDisclosing(id)') < s.index('if (frameAdmission != EnqueueAdmission.SUBMITTED)') < s.index('// RASTERIZE on the caller')
+assert s.index('val frameAdmission = enqueueDisclosing(id, onCommitted =') < s.index('if (frameAdmission != EnqueueAdmission.SUBMITTED)') < s.index('// RASTERIZE on the caller')
 if a.mutate_frame:frame=frame.replace('frameAdmission != EnqueueAdmission.SUBMITTED','false')
+frameCommit=block(s,'if (!metadataCommitted.get())').replace('return@execute','return null')
+if a.mutate_frame_commit:frameCommit=frameCommit.replace('!metadataCommitted.get()', 'false')
 end=block(s,'val endAdmission = synchronized(identityWriteLock)').replace('return@guard','return')
 q=read('queue/QueueKeyStores.kt');sweep=block(q,'fun clearOwnedFrameFiles(')
 w=read('queue/RecoveryWorker.kt');metadata=w[w.index('internal fun undeliveredRecordBytes'):w.index('\n        /**',w.index('internal fun undeliveredRecordBytes'))]
@@ -57,7 +59,7 @@ class Subject {
  fun takePreF6Dropped()=emptyMap<String,Int>()
  fun returnPreF6DroppedMap(d:Map<String,Int>) {}
  fun bindPreF6Dropped(e:String,d:Map<String,Int>) {}
- fun enqueue(r:Envelope.Record)=true
+ fun enqueue(r:Envelope.Record,onCommitted:((Boolean)->Unit)?=null)=true
  fun identify(user:String)=synchronized(identityWriteLock){identity=identity?.copy(userId=user)}
  fun replace(id:Envelope.SessionIdentity?)=synchronized(identityWriteLock){identity=id}
 '''+identity+route+flush+'''
@@ -67,8 +69,9 @@ class Subject {
  var interactionScreen:String?=null
  var lastFrameRefusal:String?=null
  var frameUploads=0
- fun frameAfterMetadata(frameAdmission:EnqueueAdmission):String? {
- '''+frame+'''
+ fun frameAfterMetadata(frameAdmission:EnqueueAdmission,committed:Boolean=true):String? {
+ val metadataCommitted=java.util.concurrent.atomic.AtomicBoolean(committed)
+ '''+frame+'\n'+frameCommit+'''
  frameUploads++;return "frame"
  }
  val sessionEndClaim=java.util.concurrent.atomic.AtomicReference<String?>(null)
@@ -122,6 +125,7 @@ fun main() {
   check(s.frameAfterMetadata(outcome)==null) { "frame upload accepted refused metadata" }
   check(s.frameUploads==0)
  }
+ check(s.frameAfterMetadata(Subject.EnqueueAdmission.SUBMITTED,false)==null) { "frame upload accepted uncommitted metadata" }
  check(s.frameAfterMetadata(Subject.EnqueueAdmission.SUBMITTED)=="frame");check(s.frameUploads==1)
  println("PASS frame bytes require submitted metadata")
  s.nextDisposition=DurableUploadPipeline.Disposition.F15_CHECKPOINT_RETRY_OWED

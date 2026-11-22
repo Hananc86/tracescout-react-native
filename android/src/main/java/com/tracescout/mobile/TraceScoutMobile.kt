@@ -2114,7 +2114,8 @@ object TraceScoutMobile {
         // byte upload, with the capture-time monotonic clock — exactly the
         // RN producer's order (RnBridge.emitFrameEvent). A frame whose bytes
         // later fail renders as a typed placeholder at its correct time.
-        val frameAdmission = enqueueDisclosing(id) { id, d ->
+        val metadataCommitted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val frameAdmission = enqueueDisclosing(id, onCommitted = { metadataCommitted.set(it) }) { id, d ->
             Envelope.visualFrame(
                 id, admit("mobile_visual_frame"), captureMono, posture(),
                 screenId = screenId, visualFrameId = frameId,
@@ -2146,6 +2147,13 @@ object TraceScoutMobile {
         val up2 = up
         val cfg2 = cfg
         worker.execute {
+            // The single worker runs the metadata append first, including its
+            // completion callback. Refused/indeterminate metadata has no clock.
+            if (!metadataCommitted.get()) {
+                lastFrameRefusal = "metadata_not_committed"
+                return@execute
+            }
+
             try {
                 val post = {
                     up2.postFrame(
@@ -3560,6 +3568,7 @@ object TraceScoutMobile {
 
     private inline fun enqueueDisclosing(expected: Envelope.SessionIdentity,
         noinline onSubmitted: (() -> Unit)? = null,
+        noinline onCommitted: ((Boolean) -> Unit)? = null,
         build: (Envelope.SessionIdentity, Map<String, Int>) -> Envelope.Record): EnqueueAdmission = synchronized(identityWriteLock) {
         val live = identity ?: return@synchronized EnqueueAdmission.NO_SESSION
         if (live.sessionId != expected.sessionId || live.projectId != expected.projectId) return@synchronized EnqueueAdmission.NO_SESSION
@@ -3579,7 +3588,7 @@ object TraceScoutMobile {
         // start the authority is published before `config`, so a concurrent
         // producer can hold a real sequence while `enqueue` returns without
         // scheduling anything — and the host was told `Recorded`.
-        if (enqueue(rec)) { onSubmitted?.invoke(); EnqueueAdmission.SUBMITTED } else EnqueueAdmission.REFUSED
+        if (enqueue(rec, onCommitted)) { onSubmitted?.invoke(); EnqueueAdmission.SUBMITTED } else EnqueueAdmission.REFUSED
     }
 
     /**
@@ -3587,20 +3596,14 @@ object TraceScoutMobile {
  * function, so the queue's drop policy is identical across bindings and is
  * covered by the golden fixtures rather than reimplemented here.
  */
-    private fun enqueue(rec: Envelope.Record): Boolean {
+    private fun enqueue(rec: Envelope.Record, onCommitted: ((Boolean) -> Unit)? = null): Boolean {
         // PRE-F6: the counts were MOVED out of the accumulator to build this
         // envelope and are already bound in flight to `rec.eventId`, so every
         // path that does not reach the durable append must put them back —
         // otherwise a disclosure is erased by a path that lost nothing.
         //
-        // AND THE SIGNATURE IS DELIBERATELY UNCHANGED. Three ACCEPTED pins
-        // (`AuthorityOwnershipPinsTest` the specification, `SliceBSourceTest` S1,
-        // `SliceCSourceTest` SC3) slice this function by the literal
-        // `private fun enqueue(rec: Envelope.Record)`. Adding a parameter broke
-        // all three anchors while changing none of their contracts — so the
-        // disclosure travels through the in-flight field keyed by event id
-        // rather than through a new argument. Re-pointing three accepted pins
-        // because a new change moved their anchor is the larger intervention.
+        // Completion is distinct from scheduling: frame bytes require a
+        // committed metadata append. Other producers only need admission.
         val cfg = config ?: run { returnPreF6Dropped(rec.eventId); return false }
         if (rec.sequence < 0) {
             returnPreF6Dropped(rec.eventId)
@@ -3791,6 +3794,8 @@ object TraceScoutMobile {
         // Persist off the caller's thread; the durable copy is what survives a
         // process death, so it must exist before the next upload attempt.
         worker.execute {
+            var committed = false
+            try {
             // THIS LINE DISCARDED THREE SEPARATE FACTS. It was
             // `try { store?.append(rec.bytes) } catch (_: Throwable) {}`:
             // the AppendResult was discarded, the exception was discarded, and
@@ -3968,6 +3973,7 @@ object TraceScoutMobile {
                 // a repeated disclosure is cheaper than a silent erase.
                 if (r.stored && r.durability ==
                         com.tracescout.mobile.queue.EncryptedEventStore.Durability.COMMITTED) {
+                    committed = true
                     settlePreF6Dropped(rec.eventId)
                 } else {
                     returnPreF6Dropped(rec.eventId)
@@ -3978,6 +3984,9 @@ object TraceScoutMobile {
                     "eventType" to rec.eventType, "sequence" to rec.sequence)
                 settleAppend(ticket, owner, false, com.tracescout.mobile.queue.EncryptedEventStore.Durability.NOT_COMMITTED)
                 returnPreF6Dropped(rec.eventId)
+            }
+            } finally {
+                onCommitted?.invoke(committed)
             }
         }
         // The append task is scheduled; its durability is the worker's answer.

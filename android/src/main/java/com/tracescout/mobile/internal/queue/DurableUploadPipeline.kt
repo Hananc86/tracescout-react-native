@@ -980,6 +980,8 @@ class DurableUploadPipeline(
 
     fun upload(records: List<ByteArray>, fallbackSessionId: String): Unit = synchronized(carrierBudget) {
         drainPosted = 0; drainProgressed = false; drainEpoch = ""
+        // A pre-POST refusal still owns queued work; only a proven empty image may clear it.
+        disposition = if (records.isEmpty()) Disposition.EMPTY else Disposition.RETRYABLE_REMAINING
         var died = false
         try {
             uploadInner(records, fallbackSessionId)
